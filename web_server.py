@@ -1360,8 +1360,34 @@ def handle_config():
         if 'dithering' in new_config:
             if new_config['dithering'] in [0, 2, 3, 4]:
                 config['dithering'] = new_config['dithering']
-                if seismic and not streaming:
-                    seismic.set_dithering(config['dithering'])
+                if seismic:
+                    try:
+                        if streaming:
+                            # Try on-the-fly first (if MCU supports)
+                            try:
+                                seismic.set_dithering(config['dithering'])
+                                print("Applied dithering while streaming")
+                            except Exception:
+                                # Fallback: brief stop/apply/resume
+                                prev_rate = config.get('stream_rate', 100.0)
+                                try:
+                                    seismic.stop_streaming()
+                                except Exception:
+                                    pass
+                                time.sleep(0.2)
+                                seismic.set_dithering(config['dithering'])
+                                time.sleep(0.2)
+                                # Hint downstream to suppress initial gap
+                                global expect_sequence_reset
+                                expect_sequence_reset = True
+                                start_result = seismic.start_streaming(prev_rate)
+                                if not (start_result and start_result[0]):
+                                    print("Warning: Failed to resume streaming after dithering change")
+                                    global streaming as streaming_flag  # no-op to document intent
+                        else:
+                            seismic.set_dithering(config['dithering'])
+                    except Exception as e:
+                        print(f"Warning: Could not apply dithering: {e}")
         
         if 'stream_rate' in new_config:
             if 1 <= new_config['stream_rate'] <= 1000:
@@ -1519,6 +1545,14 @@ def connect_device():
             time.sleep(0.5)
             seismic.set_channels(config['channels'])
             time.sleep(0.5)
+            # Apply dithering/oversampling from config on connect
+            try:
+                if 'dithering' in config:
+                    seismic.set_dithering(config['dithering'])
+                    print(f"\ud83d\udd27 Dithering set to {config['dithering']}x on connect")
+                    time.sleep(0.3)
+            except Exception as e:
+                print(f"Warning: Could not set dithering on connect: {e}")
             
             # Sync filter setting if available in config
             if app_config and 'device' in app_config and 'filter_index' in app_config['device']:
