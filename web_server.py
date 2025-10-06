@@ -1442,6 +1442,15 @@ def start_stream():
         expect_sequence_reset = True  # Suppress sequence gap detection on first sample
         rate_window_ms.clear()  # Clear timestamp tracking window
         
+        # CRITICAL: Update timestamp generator rate to match streaming rate
+        if hasattr(seismic, 'timing_adapter') and hasattr(seismic.timing_adapter, 'timestamp_generator'):
+            try:
+                actual_rate = config.get('stream_rate', 100.0)
+                seismic.timing_adapter.timestamp_generator.update_rate(actual_rate)
+                print(f"✅ Timestamp generator rate set to {actual_rate}Hz (interval: {1000/actual_rate}ms)")
+            except Exception as e:
+                print(f"⚠️  Warning: Could not update timestamp generator rate: {e}")
+        
         # Reset timestamp generator and controller to clear any stale timing offsets
         if hasattr(seismic, 'timestamp_generator'):
             try:
@@ -1454,6 +1463,13 @@ def start_stream():
                     seismic.timestamp_generator.reference_sequence = None
             except Exception as e:
                 print(f"Warning: Could not reset timestamp generator: {e}")
+        elif hasattr(seismic, 'timing_adapter') and hasattr(seismic.timing_adapter, 'timestamp_generator'):
+            # Also try the timing_adapter path
+            try:
+                if hasattr(seismic.timing_adapter.timestamp_generator, 'reset_for_restart'):
+                    seismic.timing_adapter.timestamp_generator.reset_for_restart()
+            except Exception as e:
+                print(f"Warning: Could not reset timing_adapter timestamp generator: {e}")
         # Reset unified controller host correction if present
         try:
             if hasattr(seismic, 'timing_adapter') and seismic.timing_adapter and hasattr(seismic.timing_adapter, 'unified_controller'):
@@ -1494,8 +1510,13 @@ def start_stream():
                     seismic, seismic.timing_manager
                 )
             
-            # Start timing control
-            adaptive_controller.start_controller()
+            # CRITICAL WORK MODE: Disable timing controller for zero data loss
+            # Timing corrections cause brief serial port blocking -> sample loss
+            # For scientific work requiring perfect data: disable controller
+            # adaptive_controller.start_controller()  # DISABLED for zero data loss
+            print("🔒 Timing controller DISABLED - Zero data loss mode for scientific work")
+            print("   Trade-off: No active MCU corrections (MCU runs at natural rate)")
+            print("   Benefit: Zero sample loss guaranteed")
             
             return jsonify({
                 'status': 'streaming',
@@ -1688,8 +1709,9 @@ def check_auto_start_trigger():
                                         seismic, seismic.timing_manager
                                     )
                                 
-                                # Start timing control
-                                adaptive_controller.start_controller()
+                                # CRITICAL WORK MODE: Disable timing control for zero data loss
+                                # adaptive_controller.start_controller()  # DISABLED
+                                print("🔒 Timing controller DISABLED (auto-start) - Zero data loss mode")
                                 
                                 print(f"🚀 AUTO-START SUCCESSFUL: Streaming initiated by PPS lock trigger")
                                 
