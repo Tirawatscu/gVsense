@@ -628,7 +628,9 @@ class SimplifiedTimestampGenerator:
             # Clear all tracking
             self.last_sequence = None
             self.reference_sequence = None
-            self.reference_time = time.time()
+            # Force full re-initialization on next sample
+            self.reference_time = None
+            self.is_initialized = False
             
             # Reset statistics (but preserve configuration)
             self.stats['samples_processed'] = 0
@@ -909,6 +911,27 @@ class UnifiedTimingController:
     def apply_host_correction(self, timestamp_ms):
         """Apply current host correction to a timestamp"""
         return timestamp_ms + self.host_correction_ms
+    
+    def reset_state(self):
+        """Reset controller state between streaming sessions"""
+        try:
+            self.host_correction_ms = 0.0
+            # Reset basic stats while keeping history size
+            self.stats['corrections_applied'] = 0
+            self.stats['mcu_adjustments'] = 0
+            self.stats['host_adjustments'] = 0
+            self.stats['measurements_taken'] = 0
+            self.stats['sign_corrections_applied'] = 0
+            self.stats['target_achieved'] = False
+            self.stats['convergence_time_s'] = 0.0
+            # Clear only recent error history
+            try:
+                self.stats['error_history'].clear()
+            except Exception:
+                pass
+            print("🔄 UnifiedTimingController: state reset (host correction cleared)")
+        except Exception as e:
+            print(f"Warning: failed to reset unified controller state: {e}")
     
     # Public setters for runtime configuration
     def set_measurement_interval(self, seconds: float):

@@ -1383,7 +1383,7 @@
                     document.getElementById('filter-index').value = config.filter_index || 3;
                     
                     // Set Dithering dropdown
-                    document.getElementById('dithering').value = config.dithering || 4;
+                    document.getElementById('dithering').value = (config.dithering ?? 4);
                     
                     // Set Stream Rate input
                     document.getElementById('stream-rate').value = config.stream_rate || 100;

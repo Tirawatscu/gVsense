@@ -1383,7 +1383,6 @@ def handle_config():
                                 start_result = seismic.start_streaming(prev_rate)
                                 if not (start_result and start_result[0]):
                                     print("Warning: Failed to resume streaming after dithering change")
-                                    global streaming as streaming_flag  # no-op to document intent
                         else:
                             seismic.set_dithering(config['dithering'])
                     except Exception as e:
@@ -1443,7 +1442,7 @@ def start_stream():
         expect_sequence_reset = True  # Suppress sequence gap detection on first sample
         rate_window_ms.clear()  # Clear timestamp tracking window
         
-        # Reset timestamp generator to clear any stale timing offsets
+        # Reset timestamp generator and controller to clear any stale timing offsets
         if hasattr(seismic, 'timestamp_generator'):
             try:
                 # Call the new reset method to clear all timing state
@@ -1455,6 +1454,14 @@ def start_stream():
                     seismic.timestamp_generator.reference_sequence = None
             except Exception as e:
                 print(f"Warning: Could not reset timestamp generator: {e}")
+        # Reset unified controller host correction if present
+        try:
+            if hasattr(seismic, 'timing_adapter') and seismic.timing_adapter and hasattr(seismic.timing_adapter, 'unified_controller'):
+                controller = seismic.timing_adapter.unified_controller
+                if controller and hasattr(controller, 'reset_state'):
+                    controller.reset_state()
+        except Exception as e:
+            print(f"Warning: Could not reset unified controller state: {e}")
         
         # Start streaming (timing system handles synchronization automatically)
         result = seismic.start_streaming(desired_rate)
@@ -1636,7 +1643,7 @@ def check_auto_start_trigger():
                             expect_sequence_reset = True  # Suppress sequence gap detection on first sample
                             rate_window_ms.clear()  # Clear timestamp tracking window
                             
-                            # Reset timestamp generator to clear any stale timing offsets
+                            # Reset timestamp generator and controller to clear any stale timing offsets
                             if hasattr(seismic, 'timestamp_generator'):
                                 try:
                                     # Call the new reset method to clear all timing state
@@ -1647,6 +1654,14 @@ def check_auto_start_trigger():
                                         print("⚠️  Warning: reset_for_restart method not found")
                                 except Exception as e:
                                     print(f"Warning: Could not reset timestamp generator: {e}")
+                            # Reset unified controller host correction if present
+                            try:
+                                if hasattr(seismic, 'timing_adapter') and seismic.timing_adapter and hasattr(seismic.timing_adapter, 'unified_controller'):
+                                    controller = seismic.timing_adapter.unified_controller
+                                    if controller and hasattr(controller, 'reset_state'):
+                                        controller.reset_state()
+                            except Exception as e:
+                                print(f"Warning: Could not reset unified controller state: {e}")
                             
                             result = seismic.start_streaming(config['stream_rate'])
                             if result and result[0]:
