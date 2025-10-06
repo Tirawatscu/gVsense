@@ -1323,6 +1323,32 @@
         async function toggleStream() {
             try {
                 const action = streaming ? 'stop' : 'start';
+                // If stopping, ask whether to suspend auto-start until reboot
+                if (action === 'stop') {
+                    const choice = confirm('Stop streaming now?\n\nDo you also want to suspend auto-start triggers until the next reboot?');
+                    if (choice) {
+                        try {
+                            await fetch('/api/auto_start/suspend_until_reboot', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ suspend: true })
+                            });
+                        } catch (e) {
+                            console.warn('Failed to set suspend_until_reboot:', e);
+                        }
+                    } else {
+                        // Explicitly ensure not suspended if user declines
+                        try {
+                            await fetch('/api/auto_start/suspend_until_reboot', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ suspend: false })
+                            });
+                        } catch (e) {
+                            // ignore
+                        }
+                    }
+                }
                 const response = await fetch(`/api/stream/${action}`, { method: 'POST' });
                 
                 if (response.ok) {

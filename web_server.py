@@ -181,7 +181,9 @@ auto_start_state = {
     'pps_lock_count': 0,
     'auto_started': False,
     'last_check_time': 0,
-    'trigger_conditions_met': False
+    'trigger_conditions_met': False,
+    # NEW: allow suspending auto-start until next reboot (in-memory only)
+    'suspend_until_reboot': False
 }
 
 # Device configuration
@@ -726,6 +728,7 @@ def get_status():
         'threshold': auto_start_config.get('pps_signal_count_threshold', 5),
         'auto_started': auto_start_state['auto_started'],
         'conditions_met': auto_start_state['trigger_conditions_met'],
+        'suspend_until_reboot': auto_start_state.get('suspend_until_reboot', False),
         'pps_lock_status': pps_lock_status
     }
     
@@ -1550,6 +1553,9 @@ def check_auto_start_trigger():
     # Skip if auto-start not enabled or already started
     if not auto_start_config.get('enabled', False):
         return
+    # Skip if suspended until reboot
+    if auto_start_state.get('suspend_until_reboot', False):
+        return
     
     if not auto_start_config.get('trigger_on_pps_lock', False):
         return
@@ -2218,6 +2224,21 @@ def handle_auto_start_config():
         })
     
     return jsonify(auto_start_config)
+
+# NEW: suspend auto-start until reboot (not persisted)
+@app.route('/api/auto_start/suspend_until_reboot', methods=['POST'])
+def suspend_auto_start_until_reboot():
+    global auto_start_state
+    try:
+        body = request.json or {}
+        suspend = bool(body.get('suspend', True))
+        auto_start_state['suspend_until_reboot'] = suspend
+        return jsonify({
+            'status': 'ok',
+            'suspend_until_reboot': auto_start_state['suspend_until_reboot']
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/api/auto_start/status')
 def get_auto_start_status():
