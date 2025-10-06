@@ -1,0 +1,1823 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scientific Seismic Data Acquisition</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-streaming@2.0.0"></script>
+    <script src="https://cdn.jsdelivr.net/npm/luxon@3.4.4/build/global/luxon.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon@1.3.1/dist/chartjs-adapter-luxon.umd.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0a0a0a;
+            color: #e0e0e0;
+            line-height: 1.6;
+        }
+        
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        .header {
+            text-align: center;
+            padding: 20px 0;
+            border-bottom: 2px solid #333;
+            margin-bottom: 20px;
+        }
+        
+        .header h1 {
+            font-size: 2.2rem;
+            font-weight: 300;
+            margin-bottom: 5px;
+            background: linear-gradient(45deg, #00ff88, #00aaff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        .header .subtitle {
+            color: #999;
+            font-size: 1rem;
+            margin-bottom: 10px;
+        }
+        
+        .current-time {
+            font-size: 1.4rem;
+            color: #00ff88;
+            font-weight: 500;
+        }
+        
+        .main-grid {
+            display: grid;
+            grid-template-columns: 320px 1fr;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .sidebar {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+        
+        .panel {
+            background: #1a1a1a;
+            border-radius: 8px;
+            padding: 18px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            border: 1px solid #333;
+        }
+        
+        .panel h2 {
+            font-size: 1.1rem;
+            margin-bottom: 12px;
+            color: #00ff88;
+            font-weight: 500;
+            border-bottom: 1px solid #333;
+            padding-bottom: 6px;
+        }
+        
+        .status-grid {
+            display: grid;
+            gap: 8px;
+        }
+        
+        .status-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 6px 0;
+            font-size: 0.9rem;
+        }
+        
+        .status-label {
+            color: #999;
+        }
+        
+        .status-value {
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .status-indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+        
+        .status-good { background: #00ff88; box-shadow: 0 0 8px #00ff88; }
+        .status-warning { background: #ffaa00; box-shadow: 0 0 8px #ffaa00; }
+        .status-error { background: #ff4444; box-shadow: 0 0 8px #ff4444; }
+        
+        .scientific-grade {
+            background: linear-gradient(45deg, #00ff88, #00aaff);
+            color: #000;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+        
+        .btn {
+            background: #00ff88;
+            color: #000;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 5px;
+            font-size: 0.9rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-weight: 600;
+            width: 100%;
+            margin-bottom: 8px;
+        }
+        
+        .btn:hover {
+            background: #00cc6a;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(0,255,136,0.3);
+        }
+        
+        .btn:disabled {
+            background: #444;
+            color: #999;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+        
+        .btn-stop {
+            background: #ff4444;
+            color: #fff;
+        }
+        
+        .btn-stop:hover {
+            background: #cc3333;
+            box-shadow: 0 4px 12px rgba(255,68,68,0.3);
+        }
+        
+        .btn-small {
+            padding: 4px 8px;
+            font-size: 0.8rem;
+            margin-bottom: 4px;
+        }
+        
+        .select-small {
+            width: 100%;
+            padding: 4px 6px;
+            background: #0a0a0a;
+            border: 1px solid #333;
+            border-radius: 4px;
+            color: #e0e0e0;
+            font-size: 0.8rem;
+            margin-bottom: 5px;
+        }
+        
+        .config-group {
+            margin-bottom: 12px;
+        }
+        
+        .config-group label {
+            display: block;
+            margin-bottom: 4px;
+            color: #999;
+            font-size: 0.85rem;
+        }
+        
+        .config-group select,
+        .config-group input {
+            width: 100%;
+            padding: 6px;
+            background: #0a0a0a;
+            border: 1px solid #333;
+            border-radius: 4px;
+            color: #e0e0e0;
+            font-size: 0.9rem;
+        }
+        
+        .waveform-container {
+            background: #0a0a0a;
+            border-radius: 8px;
+            padding: 15px;
+            height: 200px;
+            margin-bottom: 15px;
+        }
+        
+        .stats-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .stat-card {
+            background: #222;
+            padding: 12px;
+            border-radius: 5px;
+            text-align: center;
+        }
+        
+        .stat-value {
+            font-size: 1.4rem;
+            font-weight: 700;
+            color: #00ff88;
+        }
+        
+        .stat-label {
+            color: #999;
+            font-size: 0.8rem;
+            margin-top: 4px;
+        }
+        
+        .alert {
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 10px;
+            font-size: 0.9rem;
+        }
+        
+        .alert-success {
+            background: rgba(0, 255, 136, 0.1);
+            border: 1px solid #00ff88;
+            color: #00ff88;
+        }
+        
+        .alert-warning {
+            background: rgba(255, 170, 0, 0.1);
+            border: 1px solid #ffaa00;
+            color: #ffaa00;
+        }
+        
+        .alert-error {
+            background: rgba(255, 68, 68, 0.1);
+            border: 1px solid #ff4444;
+            color: #ff4444;
+        }
+        
+        .timing-quality {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.85rem;
+        }
+        
+        .quality-badge {
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        
+        .quality-excellent { background: #00ff88; color: #000; }
+        .quality-good { background: #00aaff; color: #000; }
+        .quality-fair { background: #ffaa00; color: #000; }
+        .quality-poor { background: #ff4444; color: #fff; }
+        
+        @media (max-width: 768px) {
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
+            .stats-row {
+                grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            }
+        }
+        
+        /* Modal styles */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.8);
+            z-index: 1000;
+        }
+        
+        .modal-content {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: #1a1a1a;
+            border-radius: 10px;
+            padding: 25px;
+            max-width: 500px;
+            width: 90%;
+            max-height: 80%;
+            overflow-y: auto;
+        }
+        
+        .modal h2 {
+            color: #00ff88;
+            margin-bottom: 15px;
+            font-size: 1.3rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Scientific Seismic Data Acquisition</h1>
+            <div class="subtitle">GPS+PPS Synchronized • Host-Managed Timing • Adaptive Control • Device ID: <span id="device-id">-</span></div>
+            <div class="current-time">
+                Current Time: <span id="current-time">--:--:--.---</span>
+            </div>
+        </div>
+        
+        <!-- Configuration Modal -->
+        <div id="config-modal" class="modal">
+            <div class="modal-content">
+                <h2>Device Configuration</h2>
+                <div class="config-group">
+                    <label for="adc-rate">ADC Sample Rate</label>
+                    <select id="adc-rate">
+                        <option value="1">2.5 Hz</option>
+                        <option value="2">5 Hz</option>
+                        <option value="3">10 Hz</option>
+                        <option value="4">16.6 Hz</option>
+                        <option value="5">20 Hz</option>
+                        <option value="6">50 Hz</option>
+                        <option value="7">60 Hz</option>
+                        <option value="8">100 Hz</option>
+                        <option value="9">400 Hz</option>
+                        <option value="10" selected>1200 Hz</option>
+                        <option value="11">2400 Hz</option>
+                        <option value="12">4800 Hz</option>
+                        <option value="13">7200 Hz</option>
+                        <option value="14">14400 Hz</option>
+                        <option value="15">19200 Hz</option>
+                        <option value="16">38400 Hz</option>
+                    </select>
+                </div>
+                <div class="config-group">
+                    <label for="gain">Signal Gain</label>
+                    <select id="gain">
+                        <option value="1">1x</option>
+                        <option value="2">2x</option>
+                        <option value="3" selected>4x</option>
+                        <option value="4">8x</option>
+                        <option value="5">16x</option>
+                        <option value="6">32x</option>
+                    </select>
+                </div>
+                <div class="config-group">
+                    <label for="channels">Active Channels</label>
+                    <select id="channels">
+                        <option value="1">1 Channel</option>
+                        <option value="2">2 Channels</option>
+                        <option value="3" selected>3 Channels</option>
+                    </select>
+                </div>
+                <div class="config-group">
+                    <label for="filter-index">Digital Filter</label>
+                    <select id="filter-index">
+                        <option value="1">SINC1 - Fast response, low noise rejection</option>
+                        <option value="2">SINC2 - Balanced response</option>
+                        <option value="3" selected>SINC3 - Optimal balance (default)</option>
+                        <option value="4">SINC4 - Maximum noise rejection</option>
+                        <option value="5">FIR - Linear phase, limited rates</option>
+                    </select>
+                    <small style="color: #999; display: block; margin-top: 5px;">
+                        SINC3 provides the best balance of response time and noise rejection
+                    </small>
+                    <small style="color: #666; display: block; margin-top: 2px; font-style: italic;">
+                        💡 Filter changes are applied immediately when you click "Apply Configuration"
+                    </small>
+                </div>
+
+                <div class="config-group">
+                    <label for="dithering">Dithering & Oversampling</label>
+                    <select id="dithering">
+                        <option value="0">Off - No dithering</option>
+                        <option value="2">2x - 2x oversampling for noise reduction</option>
+                        <option value="3">3x - 3x oversampling for noise reduction</option>
+                        <option value="4" selected>4x - 4x oversampling for noise reduction (recommended)</option>
+                    </select>
+                    <small style="color: #999; display: block; margin-top: 5px;">
+                        MCU will oversample at higher rate, but output aligns with host sampling frequency
+                    </small>
+                    <small style="color: #666; display: block; margin-top: 2px; font-style: italic;">
+                        💡 Higher oversampling reduces noise but increases power consumption
+                    </small>
+                </div>
+
+                <div class="config-group">
+                    <label for="stream-rate">Output Stream Rate (Hz)</label>
+                    <input type="number" id="stream-rate" min="1" max="1000" value="100">
+                </div>
+                <div class="config-group">
+                    <label for="send-g-units">
+                        <input type="checkbox" id="send-g-units"> Send calibrated values in g units (±2g sensor)
+                    </label>
+                    <small style="color: #999; display: block; margin-top: 5px;">
+                        When enabled, both raw counts and calibrated Value_x, Value_y, Value_z will be sent
+                    </small>
+                </div>
+                <div class="config-group">
+                    <label for="remove-mean">
+                        <input type="checkbox" id="remove-mean"> Remove mean (zero baseline adjustment)
+                    </label>
+                    <small style="color: #999; display: block; margin-top: 5px;">
+                        Real-time baseline adjustment for drift compensation
+                    </small>
+                </div>
+                <div class="config-group">
+                    <label for="chart-display-mode">Chart Display Mode</label>
+                    <select id="chart-display-mode">
+                        <option value="raw">Raw Counts</option>
+                        <option value="calibrated">Calibrated Values (g)</option>
+                    </select>
+                    <small style="color: #999; display: block; margin-top: 5px;">
+                        Select what values to display in real-time charts
+                    </small>
+                </div>
+                
+                <!-- Auto-Start Configuration Section -->
+                <div style="border-top: 2px solid #333; margin-top: 20px; padding-top: 15px;">
+                    <h3 style="color: #00ff88; font-size: 1rem; margin-bottom: 10px;">🚀 Auto-Start on GPS+PPS Lock</h3>
+                    
+                    <div class="config-group">
+                        <label for="auto-start-enabled">
+                            <input type="checkbox" id="auto-start-enabled"> Enable Auto-Start Feature
+                        </label>
+                        <small style="color: #999; display: block; margin-top: 5px;">
+                            Master switch for automatic streaming on GPS+PPS lock
+                        </small>
+                    </div>
+                    
+                    <div class="config-group" id="auto-start-options" style="display: none;">
+                        <label for="trigger-on-pps-lock">
+                            <input type="checkbox" id="trigger-on-pps-lock"> Trigger on GPS+PPS Lock
+                        </label>
+                        <small style="color: #999; display: block; margin-top: 5px;">
+                            Automatically start streaming when GPS time + PPS signals are stable
+                        </small>
+                    </div>
+                    
+                    <div class="config-group" id="pps-threshold-group" style="display: none;">
+                        <label for="pps-signal-threshold">Required PPS Signal Count</label>
+                        <input type="number" id="pps-signal-threshold" min="1" max="20" value="5">
+                        <small style="color: #999; display: block; margin-top: 5px;">
+                            Number of consecutive PPS lock signals required before auto-start (1-20)
+                        </small>
+                    </div>
+                    
+                    <div class="config-group" id="check-interval-group" style="display: none;">
+                        <label for="check-interval">Check Interval (seconds)</label>
+                        <input type="number" id="check-interval" min="1" max="60" value="5">
+                        <small style="color: #999; display: block; margin-top: 5px;">
+                            How often to check GPS+PPS lock status (1-60 seconds)
+                        </small>
+                    </div>
+                    
+                    <div id="auto-start-status" style="background: #252525; padding: 10px; border-radius: 5px; margin-top: 10px; display: none;">
+                        <div style="font-size: 0.85rem; color: #999;">
+                            <div style="margin-bottom: 5px;">
+                                <strong style="color: #00ff88;">Current Status:</strong>
+                                <span id="auto-start-pps-lock-status">Unknown</span>
+                            </div>
+                            <div style="margin-bottom: 5px;">
+                                PPS Lock Count: <span id="auto-start-pps-count">0</span> / <span id="auto-start-pps-threshold">5</span>
+                            </div>
+                            <div>
+                                <span id="auto-start-conditions-status">Waiting for conditions...</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <small style="color: #ff9900; display: block; margin-top: 10px; font-weight: 500;">
+                        ⚠️ Enabling or disabling auto-start requires a system reboot to take effect
+                    </small>
+                </div>
+                
+                <div style="display: flex; gap: 10px; margin-top: 20px;">
+                    <button class="btn" onclick="applyConfig()">Apply Configuration</button>
+                    <button class="btn" onclick="closeConfigModal()">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- InfluxDB Configuration Modal -->
+        <div id="influx-config-modal" class="modal">
+            <div class="modal-content">
+                <h2>InfluxDB Configuration</h2>
+                <div class="config-group">
+                    <label for="influx-url">InfluxDB URL</label>
+                    <input type="text" id="influx-url" placeholder="http://localhost:8086" value="http://localhost:8086">
+                </div>
+                <div class="config-group">
+                    <label for="influx-token">API Token</label>
+                    <input type="password" id="influx-token" placeholder="your-token-here">
+                </div>
+                <div class="config-group">
+                    <label for="influx-org">Organization</label>
+                    <input type="text" id="influx-org" placeholder="your-org">
+                </div>
+                <div class="config-group">
+                    <label for="influx-bucket">Bucket</label>
+                    <input type="text" id="influx-bucket" placeholder="seismic-data">
+                </div>
+                <div class="config-group">
+                    <label for="influx-measurement">Measurement</label>
+                    <input type="text" id="influx-measurement" placeholder="seismic" value="seismic">
+                </div>
+                <div class="config-group">
+                    <label for="influx-building">Building (Tag)</label>
+                    <input type="text" id="influx-building" placeholder="Building 1" value="Building 1">
+                </div>
+                <div class="config-group">
+                    <label for="influx-floor">Floor (Tag)</label>
+                    <input type="text" id="influx-floor" placeholder="Fl1" value="">
+                </div>
+                <div class="config-group">
+                    <label for="influx-sensor-id">Sensor ID (Tag)</label>
+                    <input type="text" id="influx-sensor-id" placeholder="Hostname (Device ID)" value="" disabled>
+                </div>
+                <div class="config-group">
+                    <label for="influx-sensor-type">Sensor Type (Tag)</label>
+                    <input type="text" id="influx-sensor-type" placeholder="seismic_3axis" value="">
+                </div>
+                <div class="config-group">
+                    <label for="influx-tb-token">ThingsBoard Token (Tag)</label>
+                    <input type="password" id="influx-tb-token" placeholder="tb-token-here" value="">
+                </div>
+                <div class="config-group">
+                    <label for="influx-tb-secret">ThingsBoard Secret (Tag)</label>
+                    <input type="password" id="influx-tb-secret" placeholder="tb-secret-here" value="">
+                </div>
+                <div class="config-group">
+                    <label for="influx-full-range-voltage">Full Range Voltage (Tag)</label>
+                    <input type="number" id="influx-full-range-voltage" placeholder="2.5" step="0.1" value="2.5">
+                </div>
+                <div class="config-group">
+                    <label for="influx-full-range-value">Full Range Value (Tag)</label>
+                    <input type="number" id="influx-full-range-value" placeholder="1.8" step="0.1" value="1.8">
+                </div>
+                <div style="display: flex; gap: 10px; margin-top: 20px;">
+                    <button class="btn" onclick="saveInfluxConfig()">Save Configuration</button>
+                    <button class="btn" onclick="testInfluxConnection()">Test Connection</button>
+                    <button class="btn" onclick="closeInfluxConfigModal()">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- ThingsBoard Configuration Modal -->
+        <div id="thingsboard-config-modal" class="modal">
+            <div class="modal-content">
+                <h2>ThingsBoard Configuration</h2>
+                <div class="config-group">
+                    <label for="tb-host">ThingsBoard Host</label>
+                    <input type="text" id="tb-host" placeholder="localhost" value="localhost">
+                </div>
+                <div class="config-group">
+                    <label for="tb-port">MQTT Port</label>
+                    <input type="number" id="tb-port" placeholder="1883" value="1883" min="1" max="65535">
+                </div>
+                <div class="config-group">
+                    <label for="tb-access-token">Device Access Token</label>
+                    <input type="password" id="tb-access-token" placeholder="your-device-access-token">
+                </div>
+                <div class="config-group">
+                    <label for="tb-device-name">Device Name</label>
+                    <input type="text" id="tb-device-name" placeholder="SeismicDevice" value="SeismicDevice">
+                </div>
+                <div class="config-group">
+                    <label for="tb-use-tls">
+                        <input type="checkbox" id="tb-use-tls"> Use TLS/SSL Encryption
+                    </label>
+                </div>
+                <div style="display: flex; gap: 10px; margin-top: 20px;">
+                    <button class="btn" onclick="saveThingsBoardConfig()">Save Configuration</button>
+                    <button class="btn" onclick="testThingsBoardConnection()">Test Connection</button>
+                    <button class="btn" onclick="closeThingsBoardConfigModal()">Cancel</button>
+                </div>
+            </div>
+        </div>
+        
+        <div class="main-grid">
+            <div class="sidebar">
+                <!-- Timing Status Panel -->
+                <div class="panel">
+                    <h2>🕐 Timing Status</h2>
+                    <div class="status-grid">
+                    <div class="status-item">
+                            <span class="status-label">Host Source</span>
+                        <span class="status-value">
+                                <span id="host-timing-source">Unknown</span>
+                                <span id="host-timing-indicator" class="status-indicator status-error"></span>
+                        </span>
+                    </div>
+                    <div class="status-item">
+                            <span class="status-label">Host Accuracy</span>
+                            <span class="status-value" id="host-timing-accuracy">±-- µs</span>
+                    </div>
+                    <div class="status-item">
+                            <span class="status-label">MCU Source</span>
+                            <span class="status-value">
+                                <span id="mcu-timing-source">unknown</span>
+                                <span id="mcu-timing-indicator" class="status-indicator status-error"></span>
+                            </span>
+                    </div>
+                    <div class="status-item">
+                            <span class="status-label">MCU Accuracy</span>
+                            <span class="status-value" id="mcu-timing-accuracy">±-- µs</span>
+                    </div>
+                    <div class="status-item">
+                            <span class="status-label">Last Sample Time</span>
+                            <span class="status-value" id="last-sample-time">--:--:--.---</span>
+                    </div>
+                    <div class="status-item">
+                            <span class="status-label">Offset vs Now</span>
+                            <span class="status-value" id="offset-vs-now">-- ms</span>
+                    </div>
+                    <div class="status-item">
+                            <span class="status-label">Offset vs Precise</span>
+                            <span class="status-value" id="offset-vs-precise">-- ms</span>
+                    </div>
+                    <div class="status-item">
+                            <span class="status-label">Scientific Grade</span>
+                            <span class="status-value" id="scientific-grade">
+                                <span class="quality-badge quality-poor">NO</span>
+                            </span>
+                    </div>
+                    </div>
+                </div>
+                
+                <!-- Device Control Panel -->
+                <div class="panel">
+                    <h2>🔧 Device Control</h2>
+                    <div class="status-grid">
+                    <div class="status-item">
+                            <span class="status-label">Connection</span>
+                        <span class="status-value">
+                            <span id="device-status">Initializing...</span>
+                            <span id="device-indicator" class="status-indicator status-warning"></span>
+                        </span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">Port</span>
+                        <span class="status-value" id="device-port">-</span>
+                    </div>
+                    <div class="status-item">
+                            <span class="status-label">Stream Rate</span>
+                        <span class="status-value" id="device-rate">0 Hz</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">Current Filter</span>
+                        <span class="status-value" id="current-filter-display">SINC3</span>
+                    </div>
+                    </div>
+                    <button id="stream-toggle-btn" class="btn" onclick="toggleStream()">Start Stream</button>
+                    <button class="btn btn-small" onclick="showConfigModal()">Configure Device</button>
+                </div>
+                
+                <!-- Filter setting moved to Device Configuration modal -->
+                
+                <!-- Adaptive Control Panel -->
+                <div class="panel">
+                    <h2>⚡ Adaptive Control</h2>
+                    <div class="status-grid">
+                    <div class="status-item">
+                            <span class="status-label">Controller</span>
+                        <span class="status-value">
+                                <span id="adaptive-status">Disabled</span>
+                                <span id="adaptive-indicator" class="status-indicator status-error"></span>
+                        </span>
+                    </div>
+                    <div class="status-item">
+                            <span class="status-label">Current Rate</span>
+                            <span class="status-value" id="adaptive-rate">100.000 Hz</span>
+                    </div>
+                    <div class="status-item">
+                            <span class="status-label">Correction</span>
+                            <span class="status-value" id="adaptive-correction">0.0 ppm</span>
+                    </div>
+                        <div class="status-item">
+                            <span class="status-label">Performance</span>
+                            <span class="status-value" id="adaptive-performance">
+                                <span class="quality-badge quality-poor">INACTIVE</span>
+                            </span>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Data Quality Panel -->
+                <div class="panel">
+                    <h2>📊 Data Quality</h2>
+                    <div class="status-grid">
+                    <div class="status-item">
+                            <span class="status-label">Sample Rate</span>
+                            <span class="status-value" id="current-sample-rate">0.0 Hz</span>
+                    </div>
+                    <div class="status-item">
+                            <span class="status-label">Total Samples</span>
+                            <span class="status-value" id="total-samples">0</span>
+                    </div>
+                    <div class="status-item">
+                            <span class="status-label">Sequence Gaps</span>
+                            <span class="status-value" id="sequence-gaps">0</span>
+                    </div>
+                    <div class="status-item">
+                            <span class="status-label">Data Gaps</span>
+                            <span class="status-value" id="data-gaps">0</span>
+                    </div>
+                    <div class="status-item">
+                            <span class="status-label">Uptime</span>
+                            <span class="status-value" id="uptime">00:00:00</span>
+                    </div>
+                    </div>
+                </div>
+                
+                                <!-- Data Storage Panel -->
+                <div class="panel">
+                    <h2>💾 Data Storage</h2>
+                    <div class="status-grid">
+                        <div class="status-item">
+                            <span class="status-label">CSV Logging</span>
+                            <span class="status-value">
+                                <span id="csv-status">Enabled</span>
+                                <span id="csv-indicator" class="status-indicator status-good"></span>
+                            </span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">CSV Samples</span>
+                            <span class="status-value" id="csv-samples">0</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">InfluxDB</span>
+                            <span class="status-value">
+                                <span id="influx-status">Disabled</span>
+                                <span id="influx-indicator" class="status-indicator status-error"></span>
+                            </span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">ThingsBoard</span>
+                            <span class="status-value">
+                                <span id="tb-status">Disabled</span>
+                                <span id="tb-indicator" class="status-indicator status-error"></span>
+                            </span>
+                        </div>
+                    </div>
+                    <button id="influx-toggle-btn" class="btn btn-small" onclick="toggleInfluxDB()">Enable InfluxDB</button>
+                    <button class="btn btn-small" onclick="showInfluxConfig()">Configure InfluxDB</button>
+                    <button id="tb-toggle-btn" class="btn btn-small" onclick="toggleThingsBoard()">Enable ThingsBoard</button>
+                    <button class="btn btn-small" onclick="showThingsBoardConfig()">Configure ThingsBoard</button>
+                </div>
+                </div>
+                
+            <div class="main-content">
+                <!-- Key Statistics Row -->
+                <div class="stats-row">
+                    <div class="stat-card">
+                        <div class="stat-value" id="stat-rate">0.0</div>
+                        <div class="stat-label">Samples/sec</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="stat-total">0</div>
+                        <div class="stat-label">Total Samples</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="stat-accuracy">±1000</div>
+                        <div class="stat-label">Timing (µs)</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="stat-quality">POOR</div>
+                        <div class="stat-label">Data Quality</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="stat-gaps">0</div>
+                        <div class="stat-label">Gaps</div>
+                </div>
+            </div>
+            
+                <!-- System Alerts -->
+                <div id="alerts-container">
+                    <!-- Alerts will be dynamically added here -->
+                </div>
+                
+                <!-- Live Waveforms -->
+                <div class="panel">
+                    <h2>📈 Channel 1 - Live Waveform</h2>
+                    <div class="waveform-container">
+                        <canvas id="waveform1"></canvas>
+                    </div>
+                </div>
+                
+                <div class="panel">
+                    <h2>📈 Channel 2 - Live Waveform</h2>
+                    <div class="waveform-container">
+                        <canvas id="waveform2"></canvas>
+                    </div>
+                </div>
+                
+                <div class="panel">
+                    <h2>📈 Channel 3 - Live Waveform</h2>
+                    <div class="waveform-container">
+                        <canvas id="waveform3"></canvas>
+                    </div>
+                </div>
+                        </div>
+        </div>
+    </div>
+    
+    <script>
+        // WebSocket connection
+        const socket = io();
+        
+        // State
+        let connected = false;
+        let streaming = false;
+        let charts = {};
+        let lastStatusUpdate = 0;
+        let serverTimeOffsetMs = 0; // server_time_ms - client_now_ms (estimated)
+        let lastServerSyncMs = 0;
+        
+        // Initialize charts
+        function initCharts() {
+            const chartConfig = (label, color) => ({
+                type: 'line',
+                data: {
+                    datasets: [{
+                        label: label,
+                        data: [],
+                        borderColor: color,
+                        backgroundColor: 'transparent',
+                        borderWidth: 1.5,
+                        pointRadius: 0,
+                        tension: 0,
+                        fill: false,
+                        spanGaps: false
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
+                    interaction: {
+                        intersect: false,
+                        mode: 'nearest'
+                    },
+                    plugins: {
+                        legend: { display: false },
+                        streaming: {
+                            duration: 12000,  // 15 seconds
+                            refresh: 200,
+                            delay: 200,
+                            frameRate: 20
+                        }
+                    },
+                    scales: {
+                        x: {
+                            type: 'realtime',
+                            realtime: {
+                                duration: 12000,
+                                refresh: 200,
+                                delay: 200
+                            },
+                            grid: { color: '#333' },
+                            ticks: { color: '#999' }
+                        },
+                        y: {
+                            grid: { color: '#333' },
+                            ticks: { color: '#999' }
+                        }
+                    }
+                }
+            });
+            
+            charts.ch1 = new Chart(document.getElementById('waveform1'), chartConfig('Channel 1', '#00ff88'));
+            charts.ch2 = new Chart(document.getElementById('waveform2'), chartConfig('Channel 2', '#00aaff'));
+            charts.ch3 = new Chart(document.getElementById('waveform3'), chartConfig('Channel 3', '#ff00aa'));
+            
+            // Update chart labels based on display mode
+            updateChartLabels();
+        }
+        
+        // Update chart labels based on display mode
+        function updateChartLabels() {
+            // Get current config or use defaults
+            fetch('/api/config')
+                .then(response => response.json())
+                .then(config => {
+                    const isCalibrated = config.chart_display_mode === 'calibrated' && config.send_g_units;
+                    const yLabel = isCalibrated ? 'Acceleration (g)' : 'Raw Counts';
+                    
+                    // Update y-axis labels for all charts
+                    if (charts.ch1) {
+                        charts.ch1.options.scales.y.title = {
+                            display: true,
+                            text: yLabel,
+                            color: '#999'
+                        };
+                        charts.ch1.update('none');
+                    }
+                    if (charts.ch2) {
+                        charts.ch2.options.scales.y.title = {
+                            display: true,
+                            text: yLabel,
+                            color: '#999'
+                        };
+                        charts.ch2.update('none');
+                    }
+                    if (charts.ch3) {
+                        charts.ch3.options.scales.y.title = {
+                            display: true,
+                            text: yLabel,
+                            color: '#999'
+                        };
+                        charts.ch3.update('none');
+                    }
+                })
+                .catch(error => console.error('Error updating chart labels:', error));
+        }
+        
+        // Sync server time and compute offset (simple NTP-style midpoint)
+        async function syncServerTime() {
+            try {
+                const c0 = performance.now();
+                const c0Abs = Date.now();
+                const resp = await fetch('/api/server_time');
+                const data = await resp.json();
+                const c1 = performance.now();
+                const c1Abs = Date.now();
+                const clientMidMs = c0Abs + Math.round((c1 - c0) / 2);
+                const serverMs = (typeof data.precise_time_ms === 'number') ? data.precise_time_ms : data.server_time_ms;
+                if (typeof serverMs === 'number') {
+                    serverTimeOffsetMs = serverMs - clientMidMs;
+                    lastServerSyncMs = c1Abs;
+                }
+            } catch (e) {
+                // Keep previous offset on failure
+            }
+        }
+
+        // Update current time display (server time with client-server diff)
+        function updateCurrentTime() {
+            const clientNow = Date.now();
+            const serverNowMs = clientNow + serverTimeOffsetMs;
+            const dt = new Date(serverNowMs);
+            const timeStr = dt.toLocaleTimeString('en-US', {
+                hour12: false,
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            }) + '.' + dt.getMilliseconds().toString().padStart(3, '0');
+            const diffMs = Math.round(serverNowMs - clientNow);
+            const sign = diffMs >= 0 ? '+' : '';
+            document.getElementById('current-time').textContent = `${timeStr} (${sign}${diffMs} ms)`;
+        }
+        
+        // Socket event handlers
+        socket.on('connect', () => {
+            console.log('Connected to server');
+            connected = true;
+            updateStatus();
+        });
+        
+        socket.on('disconnect', () => {
+            console.log('Disconnected from server');
+            connected = false;
+        });
+        
+        socket.on('new_data', (data) => {
+            const timestamp = data.timestamp;
+            
+            // Use chart_values for display (either raw counts or calibrated values)
+            const displayValues = data.chart_values || data.values;
+            
+            // Add data to charts
+            charts.ch1.data.datasets[0].data.push({
+                x: timestamp,
+                y: displayValues[0] || 0
+            });
+            
+            charts.ch2.data.datasets[0].data.push({
+                x: timestamp,
+                y: displayValues[1] || 0
+            });
+            
+            charts.ch3.data.datasets[0].data.push({
+                x: timestamp,
+                y: displayValues[2] || 0
+            });
+        });
+        
+        socket.on('status_update', (status) => {
+            updateAllStatus(status);
+            lastStatusUpdate = Date.now();
+        });
+        
+        // Main status update function
+        function updateAllStatus(status) {
+            // Update timing status
+            updateTimingStatus(status);
+            
+            // Update device status
+            updateDeviceStatus(status);
+            
+            // Update adaptive control status
+            updateAdaptiveStatus(status);
+            
+            // Update data quality
+            updateDataQuality(status);
+            
+            // Update storage status
+            updateStorageStatus(status);
+            
+            // Update statistics
+            updateStatistics(status);
+            
+            // Update system alerts
+            updateAlerts(status);
+        }
+        
+        function updateTimingStatus(status) {
+            // Host timing
+            if (status.host_timing) {
+                const hostSource = status.host_timing.timing_quality?.source || 'Unknown';
+                const hostAccuracy = status.host_timing.timing_quality?.accuracy_us || 0;
+                
+                document.getElementById('host-timing-source').textContent = hostSource;
+                document.getElementById('host-timing-accuracy').textContent = `±${hostAccuracy.toFixed(1)} µs`;
+                
+                const hostIndicator = document.getElementById('host-timing-indicator');
+                if (hostAccuracy < 10) {
+                    hostIndicator.className = 'status-indicator status-good';
+                } else if (hostAccuracy < 100) {
+                    hostIndicator.className = 'status-indicator status-warning';
+                } else {
+                    hostIndicator.className = 'status-indicator status-error';
+                }
+            }
+            
+            // MCU timing
+            if (status.mcu_timing) {
+                const mcuSource = status.mcu_timing.source || 'unknown';
+                const mcuAccuracy = status.mcu_timing.accuracy_us || 1000;
+                const scientificGrade = status.mcu_timing.scientific_grade || false;
+                
+                document.getElementById('mcu-timing-source').textContent = mcuSource.toUpperCase();
+                document.getElementById('mcu-timing-accuracy').textContent = `±${mcuAccuracy.toFixed(1)} µs`;
+                
+                const mcuIndicator = document.getElementById('mcu-timing-indicator');
+                if (mcuAccuracy < 10) {
+                    mcuIndicator.className = 'status-indicator status-good';
+                } else if (mcuAccuracy < 100) {
+                    mcuIndicator.className = 'status-indicator status-warning';
+                } else {
+                    mcuIndicator.className = 'status-indicator status-error';
+                }
+                
+                // Scientific grade indicator
+                const scientificElement = document.getElementById('scientific-grade');
+                if (scientificGrade) {
+                    scientificElement.innerHTML = '<span class="quality-badge quality-excellent">YES</span>';
+                } else if (mcuAccuracy <= 100) {
+                    scientificElement.innerHTML = '<span class="quality-badge quality-good">TARGET</span>';
+                } else {
+                    scientificElement.innerHTML = '<span class="quality-badge quality-poor">NO</span>';
+                }
+            }
+
+            // Timestamp health
+            if (status.timestamp_health) {
+                const th = status.timestamp_health;
+                if (typeof th.last_timestamp === 'number') {
+                    const dt = new Date(th.last_timestamp);
+                    const timeStr = dt.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit'}) + '.' + dt.getMilliseconds().toString().padStart(3, '0');
+                    document.getElementById('last-sample-time').textContent = timeStr;
+                }
+                if (typeof th.offset_ms === 'number') {
+                    document.getElementById('offset-vs-now').textContent = `${th.offset_ms} ms`;
+                }
+                if (typeof th.offset_precise_ms === 'number') {
+                    document.getElementById('offset-vs-precise').textContent = `${th.offset_precise_ms} ms`;
+                }
+            }
+        }
+        
+        function updateDeviceStatus(status) {
+            const deviceStatus = status.device?.status || 'Disconnected';
+            const connected = status.device?.connected || false;
+            
+            document.getElementById('device-status').textContent = deviceStatus;
+            if (status.device_id) {
+                document.getElementById('device-id').textContent = status.device_id;
+            }
+            document.getElementById('device-port').textContent = status.config?.port || '-';
+            document.getElementById('device-rate').textContent = 
+                streaming ? `${(status.stats?.current_rate || 0).toFixed(1)} Hz` : '0 Hz';
+            
+            const indicator = document.getElementById('device-indicator');
+            const streamBtn = document.getElementById('stream-toggle-btn');
+            
+            if (connected && deviceStatus === 'Streaming') {
+                indicator.className = 'status-indicator status-good';
+                    streamBtn.textContent = 'Stop Stream';
+                    streamBtn.className = 'btn btn-stop';
+                streamBtn.disabled = false;
+                streaming = true;
+            } else if (connected) {
+                indicator.className = 'status-indicator status-warning';
+                    streamBtn.textContent = 'Start Stream';
+                    streamBtn.className = 'btn';
+                streamBtn.disabled = false;
+                streaming = false;
+            } else {
+                indicator.className = 'status-indicator status-error';
+                streamBtn.textContent = 'Start Stream';
+                streamBtn.className = 'btn';
+                streamBtn.disabled = true;
+                streaming = false;
+            }
+            
+            // Display current filter status
+            if (status.filter) {
+                document.getElementById('current-filter-display').textContent = status.filter.name;
+            }
+        }
+        
+        function updateAdaptiveStatus(status) {
+            if (status.adaptive_timing) {
+                const enabled = status.adaptive_timing.enabled || false;
+                const running = status.adaptive_timing.running || false;
+                const performance = status.adaptive_timing.performance || 'inactive';
+                const stats = status.adaptive_timing.stats || {};
+                
+                document.getElementById('adaptive-status').textContent = 
+                    enabled ? (running ? 'Active' : 'Ready') : 'Disabled';
+                
+                const indicator = document.getElementById('adaptive-indicator');
+                if (enabled && running) {
+                    indicator.className = 'status-indicator status-good';
+                } else if (enabled) {
+                    indicator.className = 'status-indicator status-warning';
+                } else {
+                    indicator.className = 'status-indicator status-error';
+                }
+                
+                // Update performance badge
+                const perfElement = document.getElementById('adaptive-performance');
+                const perfClass = performance === 'excellent' ? 'quality-excellent' :
+                                 performance === 'good' ? 'quality-good' :
+                                 performance === 'fair' ? 'quality-fair' : 'quality-poor';
+                perfElement.innerHTML = `<span class="quality-badge ${perfClass}">${performance.toUpperCase()}</span>`;
+                
+                // Update rate and correction
+                document.getElementById('adaptive-rate').textContent = 
+                    `${(stats.current_rate_hz || 100).toFixed(3)} Hz`;
+                document.getElementById('adaptive-correction').textContent = 
+                    `${(stats.current_correction_ppm || 0).toFixed(1)} ppm`;
+            }
+        }
+        
+        function updateDataQuality(status) {
+            const stats = status.stats || {};
+            
+            document.getElementById('current-sample-rate').textContent = 
+                `${(stats.current_rate || 0).toFixed(1)} Hz`;
+            document.getElementById('total-samples').textContent = 
+                (stats.samples_received || 0).toLocaleString();
+            document.getElementById('sequence-gaps').textContent = 
+                stats.sequence_gaps || 0;
+            document.getElementById('data-gaps').textContent = 
+                stats.data_gaps || 0;
+            
+            // Calculate uptime
+            if (stats.start_time) {
+                const uptime = Date.now() / 1000 - stats.start_time;
+                const hours = Math.floor(uptime / 3600);
+                const minutes = Math.floor((uptime % 3600) / 60);
+                const seconds = Math.floor(uptime % 60);
+                document.getElementById('uptime').textContent = 
+                    `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+            }
+        }
+        
+        function updateStorageStatus(status) {
+            // CSV status
+            const csvEnabled = status.csv_logging?.enabled || false;
+            document.getElementById('csv-status').textContent = csvEnabled ? 'Enabled' : 'Disabled';
+            document.getElementById('csv-samples').textContent = 
+                (status.csv_logging?.samples_logged || 0).toLocaleString();
+            
+            const csvIndicator = document.getElementById('csv-indicator');
+            csvIndicator.className = `status-indicator ${csvEnabled ? 'status-good' : 'status-error'}`;
+            
+            // InfluxDB status
+            const influxEnabled = status.saving_config?.influx_enabled || false;
+            document.getElementById('influx-status').textContent = influxEnabled ? 'Enabled' : 'Disabled';
+            
+            const influxIndicator = document.getElementById('influx-indicator');
+            influxIndicator.className = `status-indicator ${influxEnabled ? 'status-good' : 'status-error'}`;
+            
+            // Update InfluxDB toggle button
+            const influxToggleBtn = document.getElementById('influx-toggle-btn');
+            if (influxToggleBtn) {
+                influxToggleBtn.textContent = influxEnabled ? 'Disable InfluxDB' : 'Enable InfluxDB';
+            }
+            
+            // ThingsBoard status
+            const tbEnabled = status.thingsboard?.enabled || false;
+            document.getElementById('tb-status').textContent = tbEnabled ? 'Enabled' : 'Disabled';
+            
+            const tbIndicator = document.getElementById('tb-indicator');
+            tbIndicator.className = `status-indicator ${tbEnabled ? 'status-good' : 'status-error'}`;
+            
+            // Update ThingsBoard toggle button
+            const tbToggleBtn = document.getElementById('tb-toggle-btn');
+            if (tbToggleBtn) {
+                tbToggleBtn.textContent = tbEnabled ? 'Disable ThingsBoard' : 'Enable ThingsBoard';
+            }
+        }
+        
+        function updateStatistics(status) {
+            const stats = status.stats || {};
+            const mcuTiming = status.mcu_timing || {};
+            
+            document.getElementById('stat-rate').textContent = (stats.current_rate || 0).toFixed(1);
+            document.getElementById('stat-total').textContent = (stats.samples_received || 0).toLocaleString();
+            document.getElementById('stat-accuracy').textContent = `±${(mcuTiming.accuracy_us || 1000).toFixed(0)}`;
+            document.getElementById('stat-gaps').textContent = (stats.sequence_gaps || 0) + (stats.data_gaps || 0);
+            
+            // Data quality assessment
+            const accuracy = mcuTiming.accuracy_us || 1000;
+            const gapRate = ((stats.sequence_gaps || 0) + (stats.data_gaps || 0)) / Math.max(stats.samples_received || 1, 1);
+            
+            let quality = 'POOR';
+            if (accuracy < 10 && gapRate < 0.001) {
+                quality = 'EXCELLENT';
+            } else if (accuracy < 100 && gapRate < 0.01) {
+                quality = 'GOOD';
+            } else if (accuracy < 1000 && gapRate < 0.1) {
+                quality = 'FAIR';
+            }
+            
+            document.getElementById('stat-quality').textContent = quality;
+        }
+        
+        function updateAlerts(status) {
+            const alertsContainer = document.getElementById('alerts-container');
+            alertsContainer.innerHTML = ''; // Clear existing alerts
+            
+            const alerts = [];
+            
+            // Check for timing issues
+            const mcuAccuracy = status.mcu_timing?.accuracy_us || 1000;
+            if (mcuAccuracy > 100) {
+                alerts.push({
+                    type: 'warning',
+                    message: `MCU timing accuracy degraded: ±${mcuAccuracy.toFixed(1)}µs (target: ±100µs)`
+                });
+            }
+            
+            // Check for data gaps
+            const totalGaps = (status.stats?.sequence_gaps || 0) + (status.stats?.data_gaps || 0);
+            if (totalGaps > 0 && streaming) {
+                alerts.push({
+                    type: 'warning',
+                    message: `Data quality issue: ${totalGaps} gaps detected`
+                });
+            }
+            
+            // Check connection status
+            if (!status.device?.connected) {
+                alerts.push({
+                    type: 'error',
+                    message: 'Device not connected - check serial connection'
+                });
+            }
+            
+            // Check scientific grade status
+            if (status.mcu_timing?.scientific_grade && streaming) {
+                alerts.push({
+                    type: 'success',
+                    message: 'Scientific-grade timing achieved (±1-10µs accuracy)'
+                });
+            }
+            
+            // Render alerts
+            alerts.forEach(alert => {
+                const alertDiv = document.createElement('div');
+                alertDiv.className = `alert alert-${alert.type}`;
+                alertDiv.textContent = alert.message;
+                alertsContainer.appendChild(alertDiv);
+            });
+        }
+        
+        // Control functions
+        async function toggleStream() {
+            try {
+                const action = streaming ? 'stop' : 'start';
+                const response = await fetch(`/api/stream/${action}`, { method: 'POST' });
+                
+                if (response.ok) {
+                    const result = await response.json();
+                    console.log(`Stream ${action}ed:`, result);
+                    await updateStatus();
+                } else {
+                    const error = await response.json();
+                    alert(`Failed to ${action} stream: ${error.message || 'Unknown error'}`);
+                }
+            } catch (error) {
+                console.error('Stream toggle error:', error);
+                alert(`Error ${streaming ? 'stopping' : 'starting'} stream`);
+            }
+        }
+        
+        function showConfigModal() {
+            // Load current device configuration from server
+            fetch('/api/config')
+                .then(response => response.json())
+                .then(config => {
+                    // Set ADC Rate dropdown
+                    document.getElementById('adc-rate').value = config.adc_rate || 11;
+                    
+                    // Set Gain dropdown
+                    document.getElementById('gain').value = config.gain || 1;
+                    
+                    // Set Channels dropdown
+                    document.getElementById('channels').value = config.channels || 3;
+                    
+                    // Set Filter dropdown
+                    document.getElementById('filter-index').value = config.filter_index || 3;
+                    
+                    // Set Dithering dropdown
+                    document.getElementById('dithering').value = config.dithering || 4;
+                    
+                    // Set Stream Rate input
+                    document.getElementById('stream-rate').value = config.stream_rate || 100;
+                    
+                    // Set new configuration options
+                    document.getElementById('send-g-units').checked = config.send_g_units || false;
+                    document.getElementById('remove-mean').checked = config.remove_mean || false;
+                    document.getElementById('chart-display-mode').value = config.chart_display_mode || 'raw';
+                });
+            
+            // Load auto-start configuration
+            fetch('/api/auto_start/config')
+                .then(response => response.json())
+                .then(autoStartConfig => {
+                    document.getElementById('auto-start-enabled').checked = autoStartConfig.enabled || false;
+                    document.getElementById('trigger-on-pps-lock').checked = autoStartConfig.trigger_on_pps_lock || false;
+                    document.getElementById('pps-signal-threshold').value = autoStartConfig.pps_signal_count_threshold || 5;
+                    document.getElementById('check-interval').value = autoStartConfig.check_interval_seconds || 5;
+                    
+                    // Update UI visibility
+                    updateAutoStartUI();
+                })
+                .catch(error => {
+                    console.error('Error loading auto-start config:', error);
+                });
+            
+            // Load auto-start status
+            updateAutoStartStatus();
+            
+            // Show the modal
+            document.getElementById('config-modal').style.display = 'block';
+        }
+        
+        function updateAutoStartUI() {
+            const enabled = document.getElementById('auto-start-enabled').checked;
+            const triggerEnabled = document.getElementById('trigger-on-pps-lock').checked;
+            
+            // Show/hide options based on enabled state
+            document.getElementById('auto-start-options').style.display = enabled ? 'block' : 'none';
+            document.getElementById('pps-threshold-group').style.display = (enabled && triggerEnabled) ? 'block' : 'none';
+            document.getElementById('check-interval-group').style.display = (enabled && triggerEnabled) ? 'block' : 'none';
+            document.getElementById('auto-start-status').style.display = (enabled && triggerEnabled) ? 'block' : 'none';
+        }
+        
+        function updateAutoStartStatus() {
+            fetch('/api/auto_start/status')
+                .then(response => response.json())
+                .then(status => {
+                    const ppsLock = status.pps_lock_status;
+                    const state = status.state;
+                    const config = status.config;
+                    
+                    // Update PPS lock status
+                    const lockStatus = document.getElementById('auto-start-pps-lock-status');
+                    if (ppsLock.locked) {
+                        lockStatus.textContent = `✅ GPS+PPS Locked (${ppsLock.source}, ±${ppsLock.accuracy_us}µs)`;
+                        lockStatus.style.color = '#00ff88';
+                    } else {
+                        lockStatus.textContent = `⚠️ Not Locked (${ppsLock.source})`;
+                        lockStatus.style.color = '#ff9900';
+                    }
+                    
+                    // Update counts
+                    document.getElementById('auto-start-pps-count').textContent = state.pps_lock_count;
+                    document.getElementById('auto-start-pps-threshold').textContent = config.pps_signal_count_threshold;
+                    
+                    // Update conditions status
+                    const conditionsStatus = document.getElementById('auto-start-conditions-status');
+                    if (status.streaming) {
+                        conditionsStatus.textContent = '🚀 Streaming Active';
+                        conditionsStatus.style.color = '#00ff88';
+                    } else if (state.trigger_conditions_met) {
+                        conditionsStatus.textContent = '✅ Conditions Met - Starting...';
+                        conditionsStatus.style.color = '#00ff88';
+                    } else if (state.pps_lock_count > 0) {
+                        conditionsStatus.textContent = `⧗ Monitoring... (${state.pps_lock_count}/${config.pps_signal_count_threshold})`;
+                        conditionsStatus.style.color = '#00aaff';
+                    } else {
+                        conditionsStatus.textContent = '○ Waiting for GPS+PPS lock...';
+                        conditionsStatus.style.color = '#999';
+                    }
+                })
+                .catch(error => {
+                    console.error('Error loading auto-start status:', error);
+                });
+        }
+        
+        // Add event listeners for auto-start checkboxes
+        document.addEventListener('DOMContentLoaded', function() {
+            document.getElementById('auto-start-enabled').addEventListener('change', updateAutoStartUI);
+            document.getElementById('trigger-on-pps-lock').addEventListener('change', updateAutoStartUI);
+            
+            // Update auto-start status every 3 seconds when modal is open
+            setInterval(() => {
+                if (document.getElementById('config-modal').style.display === 'block') {
+                    updateAutoStartStatus();
+                }
+            }, 3000);
+        });
+        
+        function closeConfigModal() {
+            document.getElementById('config-modal').style.display = 'none';
+        }
+        
+        async function applyConfig() {
+            const config = {
+                adc_rate: parseInt(document.getElementById('adc-rate').value),
+                gain: parseInt(document.getElementById('gain').value),
+                channels: parseInt(document.getElementById('channels').value),
+                filter_index: parseInt(document.getElementById('filter-index').value),
+                dithering: parseInt(document.getElementById('dithering').value),
+                stream_rate: parseFloat(document.getElementById('stream-rate').value),
+                send_g_units: document.getElementById('send-g-units').checked,
+                remove_mean: document.getElementById('remove-mean').checked,
+                chart_display_mode: document.getElementById('chart-display-mode').value
+            };
+            
+            const autoStartConfig = {
+                enabled: document.getElementById('auto-start-enabled').checked,
+                trigger_on_pps_lock: document.getElementById('trigger-on-pps-lock').checked,
+                pps_signal_count_threshold: parseInt(document.getElementById('pps-signal-threshold').value),
+                check_interval_seconds: parseInt(document.getElementById('check-interval').value)
+            };
+            
+            try {
+                // Apply device configuration
+                const deviceResponse = await fetch('/api/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config)
+                });
+                
+                if (!deviceResponse.ok) {
+                    const error = await deviceResponse.json();
+                    alert(`Failed to apply device configuration: ${error.message || 'Unknown error'}`);
+                    return;
+                }
+                
+                // Apply auto-start configuration
+                const autoStartResponse = await fetch('/api/auto_start/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(autoStartConfig)
+                });
+                
+                if (!autoStartResponse.ok) {
+                    const error = await autoStartResponse.json();
+                    alert(`Failed to apply auto-start configuration: ${error.message || 'Unknown error'}`);
+                    return;
+                }
+                
+                const autoStartResult = await autoStartResponse.json();
+                
+                closeConfigModal();
+                await updateStatus();
+                updateChartLabels();
+                
+                // Check if reboot is needed
+                if (autoStartResult.reboot_needed) {
+                    if (confirm('⚠️ AUTO-START CONFIGURATION CHANGED\n\n' +
+                               'Auto-start settings require a system reboot to take effect.\n\n' +
+                               'Would you like to reboot the system now?\n\n' +
+                               '(All streaming will stop and the system will restart)')) {
+                        await rebootSystem();
+                    } else {
+                        alert('Configuration saved.\n\nPlease remember to reboot the system later for auto-start changes to take effect.');
+                    }
+                } else {
+                    alert('Configuration applied successfully');
+                }
+                
+            } catch (error) {
+                console.error('Configuration error:', error);
+                alert('Error applying configuration');
+            }
+        }
+        
+        async function rebootSystem() {
+            try {
+                const response = await fetch('/api/system/reboot', {
+                    method: 'POST'
+                });
+                
+                if (response.ok) {
+                    const result = await response.json();
+                    alert('🔄 SYSTEM REBOOTING\n\n' + result.message + '\n\nThe page will reload automatically.');
+                    
+                    // Wait and then reload page
+                    setTimeout(() => {
+                        window.location.reload();
+                    }, 10000); // Reload after 10 seconds
+                } else {
+                    alert('Failed to reboot system. Please reboot manually: sudo reboot');
+                }
+            } catch (error) {
+                console.error('Reboot error:', error);
+                alert('Failed to reboot system. Please reboot manually: sudo reboot');
+            }
+        }
+        
+        // Update system status
+        async function updateStatus() {
+            try {
+                const response = await fetch('/api/status');
+                const status = await response.json();
+                updateAllStatus(status);
+            } catch (error) {
+                console.error('Status update error:', error);
+            }
+        }
+        
+        // InfluxDB Configuration Functions
+        function showInfluxConfig() {
+            // Load current configuration
+            fetch('/api/influx/config')
+                .then(response => response.json())
+                .then(config => {
+                    document.getElementById('influx-url').value = config.url || 'http://localhost:8086';
+                    document.getElementById('influx-token').value = config.token || '';
+                    document.getElementById('influx-org').value = config.org || '';
+                    document.getElementById('influx-bucket').value = config.bucket || '';
+                    document.getElementById('influx-measurement').value = config.measurement || 'seismic';
+                    document.getElementById('influx-building').value = config.building || 'Building 1';
+                    document.getElementById('influx-floor').value = config.floor || '';
+                    document.getElementById('influx-sensor-id').value = config.sensor_id || '';
+                    document.getElementById('influx-sensor-type').value = config.sensor_type || '';
+                    document.getElementById('influx-tb-token').value = config.tb_token || '';
+                    document.getElementById('influx-tb-secret').value = config.tb_secret || '';
+                    document.getElementById('influx-full-range-voltage').value = config.full_range_voltage || '';
+                    document.getElementById('influx-full-range-value').value = config.full_range_value || '';
+                    
+                    document.getElementById('influx-config-modal').style.display = 'block';
+                    // Ensure Sensor ID field is disabled and reflects Device ID
+                    document.getElementById('influx-sensor-id').disabled = true;
+                })
+                .catch(error => {
+                    console.error('Error loading InfluxDB config:', error);
+                    document.getElementById('influx-config-modal').style.display = 'block';
+                });
+        }
+        
+        function closeInfluxConfigModal() {
+            document.getElementById('influx-config-modal').style.display = 'none';
+        }
+        
+        async function saveInfluxConfig() {
+            try {
+                const config = {
+                    url: document.getElementById('influx-url').value,
+                    token: document.getElementById('influx-token').value,
+                    org: document.getElementById('influx-org').value,
+                    bucket: document.getElementById('influx-bucket').value,
+                    measurement: document.getElementById('influx-measurement').value,
+                    building: document.getElementById('influx-building').value,
+                    floor: document.getElementById('influx-floor').value,
+                    sensor_id: document.getElementById('influx-sensor-id').value,
+                    sensor_type: document.getElementById('influx-sensor-type').value,
+                    tb_token: document.getElementById('influx-tb-token').value,
+                    tb_secret: document.getElementById('influx-tb-secret').value,
+                    full_range_voltage: document.getElementById('influx-full-range-voltage').value,
+                    full_range_value: document.getElementById('influx-full-range-value').value
+                };
+                
+                const response = await fetch('/api/influx/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config)
+                });
+                
+                if (response.ok) {
+                    alert('InfluxDB configuration saved successfully');
+                    closeInfluxConfigModal();
+                    await updateStatus();
+                } else {
+                    const error = await response.json();
+                    alert(`Failed to save InfluxDB configuration: ${error.message || 'Unknown error'}`);
+                }
+            } catch (error) {
+                console.error('InfluxDB config save error:', error);
+                alert('Error saving InfluxDB configuration');
+            }
+        }
+        
+        async function testInfluxConnection() {
+            try {
+                const response = await fetch('/api/influx/test', { method: 'POST' });
+                const result = await response.json();
+                
+                if (result.connected) {
+                    alert('✅ InfluxDB connection successful!');
+                } else {
+                    alert(`❌ InfluxDB connection failed: ${result.message || 'Unknown error'}`);
+                }
+            } catch (error) {
+                console.error('InfluxDB test error:', error);
+                alert('Error testing InfluxDB connection');
+            }
+        }
+        
+        async function toggleInfluxDB() {
+            try {
+                // Get current configuration first
+                const configResponse = await fetch('/api/influx/config');
+                const currentConfig = await configResponse.json();
+                
+                // Toggle enabled state
+                const response = await fetch('/api/influx/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        enabled: !currentConfig.enabled || false
+                    })
+                });
+                
+                if (response.ok) {
+                    console.log('InfluxDB toggled');
+                    await updateStatus();
+                } else {
+                    alert('Failed to toggle InfluxDB');
+                }
+            } catch (error) {
+                console.error('InfluxDB toggle error:', error);
+                alert('Error toggling InfluxDB');
+            }
+        }
+
+        // ThingsBoard Configuration Functions
+        function showThingsBoardConfig() {
+            // Load current configuration
+            fetch('/api/thingsboard/config')
+                .then(response => response.json())
+                .then(config => {
+                    document.getElementById('tb-host').value = config.host || 'localhost';
+                    document.getElementById('tb-port').value = config.port || 1883;
+                    document.getElementById('tb-access-token').value = config.access_token || '';
+                    document.getElementById('tb-device-name').value = config.device_name || 'SeismicDevice';
+                    document.getElementById('tb-use-tls').checked = config.use_tls || false;
+                    
+                    document.getElementById('thingsboard-config-modal').style.display = 'block';
+                })
+                .catch(error => {
+                    console.error('Error loading ThingsBoard config:', error);
+                    document.getElementById('thingsboard-config-modal').style.display = 'block';
+                });
+        }
+        
+        function closeThingsBoardConfigModal() {
+            document.getElementById('thingsboard-config-modal').style.display = 'none';
+        }
+        
+        async function saveThingsBoardConfig() {
+            try {
+                const config = {
+                    host: document.getElementById('tb-host').value,
+                    port: parseInt(document.getElementById('tb-port').value),
+                    access_token: document.getElementById('tb-access-token').value,
+                    device_name: document.getElementById('tb-device-name').value,
+                    use_tls: document.getElementById('tb-use-tls').checked
+                };
+                
+                const response = await fetch('/api/thingsboard/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config)
+                });
+                
+                if (response.ok) {
+                    alert('ThingsBoard configuration saved successfully');
+                    closeThingsBoardConfigModal();
+                    await updateStatus();
+                } else {
+                    const error = await response.json();
+                    alert(`Failed to save ThingsBoard configuration: ${error.message || 'Unknown error'}`);
+                }
+            } catch (error) {
+                console.error('ThingsBoard config save error:', error);
+                alert('Error saving ThingsBoard configuration');
+            }
+        }
+        
+        async function testThingsBoardConnection() {
+            try {
+                const response = await fetch('/api/thingsboard/test', { method: 'POST' });
+                const result = await response.json();
+                
+                if (result.connected && result.test_passed) {
+                    alert('✅ ThingsBoard connection successful!');
+                } else if (result.connected && !result.test_passed) {
+                    alert('⚠️ ThingsBoard connected but test failed. Check device configuration.');
+                } else {
+                    alert(`❌ ThingsBoard connection failed: ${result.message || 'Unknown error'}`);
+                }
+            } catch (error) {
+                console.error('ThingsBoard test error:', error);
+                alert('Error testing ThingsBoard connection');
+            }
+        }
+        
+        async function toggleThingsBoard() {
+            try {
+                // Get current configuration first
+                const configResponse = await fetch('/api/thingsboard/config');
+                const currentConfig = await configResponse.json();
+                
+                // Toggle enabled state
+                const response = await fetch('/api/thingsboard/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        enabled: !currentConfig.enabled || false
+                    })
+                });
+                
+                if (response.ok) {
+                    console.log('ThingsBoard toggled');
+                    await updateStatus();
+                } else {
+                    alert('Failed to toggle ThingsBoard');
+                }
+            } catch (error) {
+                console.error('ThingsBoard toggle error:', error);
+                alert('Error toggling ThingsBoard');
+            }
+                }
+        
+                // Filter setting moved to Device Configuration modal (like other device settings)
+        
+        // Close modals when clicking outside
+        window.onclick = function(event) {
+            const modals = document.querySelectorAll('.modal');
+            modals.forEach(modal => {
+                if (event.target === modal) {
+                    modal.style.display = 'none';
+                }
+            });
+        }
+        
+        // Initialize
+        initCharts();
+        updateStatus();
+        syncServerTime();
+        // No automatic filter status - filters are set manually like other settings
+        
+        // Update current time every 100ms
+        setInterval(updateCurrentTime, 100);
+        // Re-sync server time periodically to keep drift minimal
+        setInterval(syncServerTime, 2000);
+        
+        // Update status every 2 seconds
+        setInterval(updateStatus, 2000);
+        
+        // No automatic filter polling - filters are set manually like other settings
+        
+        // Check connection status
+        setInterval(() => {
+            if (Date.now() - lastStatusUpdate > 10000) {
+                // No status update for 10 seconds
+                console.warn('No status updates received - connection may be lost');
+            }
+        }, 5000);
+    </script>
+</body>
+</html> 
