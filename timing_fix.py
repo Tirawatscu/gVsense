@@ -645,7 +645,6 @@ class SimplifiedTimestampGenerator:
 class UnifiedTimingController:
     """
     CORRECTED: Single timing controller with proper correction sign logic
-    ENHANCED: Non-blocking commands to prevent data loss
     """
     
     def __init__(self, seismic_device, timing_manager):
@@ -655,14 +654,10 @@ class UnifiedTimingController:
         self.controller_thread = None
         self.start_time = None  # Will be set when controller starts
         
-        # Control parameters - OPTIMIZED to prevent data loss
-        self.measurement_interval_s = 10.0  # Measure every 10 seconds (INCREASED to reduce blocking)
+        # Control parameters - OPTIMIZED for ±0.5ms target
+        self.measurement_interval_s = 1.0  # Measure every 1 second (faster response with PPS)
         self.target_error_ms = 0.5        # Desired steady-state absolute error (±0.5ms)
         self.min_error_threshold_ms = 0.2 # Deadband to avoid chattering (±0.2ms)
-        
-        # CRITICAL: Monitor-only mode to prevent data loss after convergence
-        self.monitor_only_mode = False  # When True, only monitor - don't send corrections
-        self.auto_enable_monitor_mode = True  # Automatically switch to monitor-only after convergence
         
         # MCU control state
         self.current_mcu_interval_us = 10000.0  # 100Hz default
@@ -671,7 +666,7 @@ class UnifiedTimingController:
         # Host correction state
         self.host_correction_ms = 0.0
         
-        # Statistics - ENHANCED for performance monitoring and data loss tracking
+        # Statistics - ENHANCED for performance monitoring
         self.stats = {
             'corrections_applied': 0,
             'mcu_adjustments': 0,
@@ -680,11 +675,7 @@ class UnifiedTimingController:
             'sign_corrections_applied': 0,  # Track corrections with proper sign
             'error_history': deque(maxlen=100),  # Track recent errors for analysis
             'convergence_time_s': 0.0,  # Time to reach target_error_ms
-            'target_achieved': False,  # Whether ±10ms target has been reached
-            'commands_sent': 0,  # Track command send attempts
-            'commands_blocked': 0,  # Track blocking command operations
-            'corrections_skipped_monitor_mode': 0,  # Track corrections skipped in monitor mode
-            'potential_data_loss_events': 0  # Track events that could cause data loss
+            'target_achieved': False  # Whether ±10ms target has been reached
         }
     
     def start_controller(self):
@@ -700,8 +691,6 @@ class UnifiedTimingController:
         self.controller_thread.start()
         print("CORRECTED: Unified timing controller started with proper sign logic")
         print(f"🎯 TARGET: ±{self.target_error_ms}ms error bound with optimized correction parameters")
-        print(f"⚙️  MEASUREMENT INTERVAL: {self.measurement_interval_s}s (increased to prevent data loss)")
-        print(f"🔒 AUTO MONITOR MODE: {'Enabled' if self.auto_enable_monitor_mode else 'Disabled'} (stops corrections after convergence)")
         
     def stop_controller(self):
         """Stop the timing controller"""
@@ -808,22 +797,9 @@ class UnifiedTimingController:
                 self.stats['target_achieved'] = True
                 self.stats['convergence_time_s'] = time.time() - self.start_time
                 print(f"🎯 TARGET ACHIEVED: ±{self.target_error_ms}ms error target reached in {self.stats['convergence_time_s']:.1f}s!")
-                
-                # CRITICAL: Switch to monitor-only mode to prevent data loss
-                if self.auto_enable_monitor_mode:
-                    self.monitor_only_mode = True
-                    print(f"🔒 MONITOR-ONLY MODE ACTIVATED: Timing target achieved!")
-                    print(f"   No further MCU corrections will be sent to prevent data loss")
-                    print(f"   System will continue monitoring timing accuracy")
             
             # Skip small errors
             if abs(error_ms) < self.min_error_threshold_ms:
-                return
-            
-            # CRITICAL: Check monitor-only mode before applying corrections
-            if self.monitor_only_mode:
-                self.stats['corrections_skipped_monitor_mode'] += 1
-                print(f"📊 MONITOR MODE: Error {error_ms:+.3f}ms detected but correction SKIPPED (monitor-only)")
                 return
                 
             print(f"CORRECTED: Applying correction for error: {error_ms:+.3f}ms (target: ±{self.target_error_ms}ms)")
@@ -886,24 +862,17 @@ class UnifiedTimingController:
             print(f"  Rate: {old_rate:.6f}Hz → {new_rate:.6f}Hz")
             print(f"  Interval: {self.current_mcu_interval_us:.1f}μs → {new_interval_us:.1f}μs")
             
-            # CRITICAL: Send to MCU with NON-BLOCKING mode to prevent data loss
+            # Send to MCU
             command = f"SET_PRECISE_INTERVAL:{int(new_interval_us)}"
-            
-            # IMPROVEMENT: Use non-blocking command during streaming to avoid sample loss
-            print(f"⚡ Sending NON-BLOCKING command to prevent data loss")
-            self.stats['commands_sent'] += 1
-            
-            result = self.seismic._send_command(command, wait_response=False, timeout=0)
+            result = self.seismic._send_command(command, timeout=3.0)
             
             if result and result[0]:
-                # Optimistically update state (MCU should accept the command)
                 self.current_mcu_interval_us = new_interval_us
                 self.stats['mcu_adjustments'] += 1
                 self.stats['sign_corrections_applied'] += 1
-                print(f"✅ MCU correction sent (non-blocking)")
+                print(f"CORRECTED: MCU correction applied successfully")
             else:
-                print(f"⚠️  MCU correction send failed: {result}")
-                self.stats['potential_data_loss_events'] += 1
+                print(f"CORRECTED: MCU correction failed: {result}")
                 
         except Exception as e:
             print(f"MCU correction error: {e}")
@@ -947,8 +916,6 @@ class UnifiedTimingController:
         """Reset controller state between streaming sessions"""
         try:
             self.host_correction_ms = 0.0
-            self.monitor_only_mode = False  # Reset monitor mode for new session
-            
             # Reset basic stats while keeping history size
             self.stats['corrections_applied'] = 0
             self.stats['mcu_adjustments'] = 0
@@ -957,17 +924,12 @@ class UnifiedTimingController:
             self.stats['sign_corrections_applied'] = 0
             self.stats['target_achieved'] = False
             self.stats['convergence_time_s'] = 0.0
-            self.stats['commands_sent'] = 0
-            self.stats['commands_blocked'] = 0
-            self.stats['corrections_skipped_monitor_mode'] = 0
-            self.stats['potential_data_loss_events'] = 0
-            
             # Clear only recent error history
             try:
                 self.stats['error_history'].clear()
             except Exception:
                 pass
-            print("🔄 UnifiedTimingController: state reset (host correction cleared, monitor mode disabled)")
+            print("🔄 UnifiedTimingController: state reset (host correction cleared)")
         except Exception as e:
             print(f"Warning: failed to reset unified controller state: {e}")
     
@@ -975,7 +937,7 @@ class UnifiedTimingController:
     def set_measurement_interval(self, seconds: float):
         try:
             seconds = float(seconds)
-            if 0.2 <= seconds <= 60.0:  # Increased max to 60s
+            if 0.2 <= seconds <= 10.0:
                 self.measurement_interval_s = seconds
                 print(f"🔧 Adaptive controller: measurement interval set to {seconds}s")
         except Exception:
@@ -998,46 +960,10 @@ class UnifiedTimingController:
                 print(f"🔧 Adaptive controller: deadband set to ±{threshold}ms")
         except Exception:
             pass
-    
-    def set_monitor_only_mode(self, enabled: bool):
-        """Enable/disable monitor-only mode"""
-        try:
-            self.monitor_only_mode = bool(enabled)
-            print(f"🔒 Monitor-only mode: {'ENABLED' if self.monitor_only_mode else 'DISABLED'}")
-            if self.monitor_only_mode:
-                print(f"   No MCU corrections will be sent (prevents data loss)")
-            else:
-                print(f"   MCU corrections enabled (may cause brief data loss during adjustments)")
-        except Exception:
-            pass
-    
-    def set_auto_monitor_mode(self, enabled: bool):
-        """Enable/disable automatic monitor-only mode after convergence"""
-        try:
-            self.auto_enable_monitor_mode = bool(enabled)
-            print(f"⚙️  Auto monitor mode: {'ENABLED' if self.auto_enable_monitor_mode else 'DISABLED'}")
-        except Exception:
-            pass
         
     def get_stats(self):
-        """Get controller statistics with data loss analysis"""
-        stats = dict(self.stats)
-        
-        # Add calculated metrics
-        if self.stats['measurements_taken'] > 0:
-            stats['correction_rate'] = self.stats['corrections_applied'] / self.stats['measurements_taken']
-        else:
-            stats['correction_rate'] = 0.0
-        
-        # Add current mode status
-        stats['monitor_only_active'] = self.monitor_only_mode
-        stats['auto_monitor_enabled'] = self.auto_enable_monitor_mode
-        stats['measurement_interval_s'] = self.measurement_interval_s
-        
-        # Data loss risk assessment
-        stats['data_loss_risk'] = 'LOW' if self.monitor_only_mode else 'MEDIUM'
-        
-        return stats
+        """Get controller statistics"""
+        return dict(self.stats)
 
 
 # Integration adapter for existing codebase
@@ -1187,105 +1113,3 @@ def diagnose_correction_direction(mcu_interval_us, target_interval_us, error_ms)
     print(f"  New interval: {new_interval:.1f}μs ({new_rate:.6f}Hz)")
     print(f"  Direction: {'SLOWER' if new_rate < actual_rate else 'FASTER'}")
     print("="*60)
-
-
-def analyze_data_loss_from_stats(stats_dict):
-    """
-    Analyze data loss statistics and provide recommendations
-    
-    Args:
-        stats_dict: Dictionary with keys:
-            - 'samples_received': Total samples received
-            - 'sequence_gaps': Total sequence gaps detected
-            - 'duration_s': Duration in seconds
-            - 'expected_rate_hz': Expected sampling rate
-            
-    Returns:
-        dict: Analysis with loss percentage, potential causes, and recommendations
-    """
-    samples_received = stats_dict.get('samples_received', 0)
-    sequence_gaps = stats_dict.get('sequence_gaps', 0)
-    duration_s = stats_dict.get('duration_s', 0)
-    expected_rate = stats_dict.get('expected_rate_hz', 100)
-    
-    if duration_s <= 0:
-        return {'error': 'Invalid duration'}
-    
-    expected_samples = int(duration_s * expected_rate)
-    missing_samples = expected_samples - samples_received
-    loss_percentage = (missing_samples / expected_samples * 100) if expected_samples > 0 else 0
-    
-    analysis = {
-        'expected_samples': expected_samples,
-        'actual_samples': samples_received,
-        'missing_samples': missing_samples,
-        'loss_percentage': loss_percentage,
-        'sequence_gaps_detected': sequence_gaps,
-        'severity': 'NONE',
-        'likely_causes': [],
-        'recommendations': []
-    }
-    
-    # Assess severity
-    if loss_percentage < 0.001:
-        analysis['severity'] = 'NONE'
-        analysis['recommendations'].append('✅ Excellent! No significant data loss detected')
-    elif loss_percentage < 0.01:
-        analysis['severity'] = 'NEGLIGIBLE'
-        analysis['likely_causes'].append('Normal system jitter and timing corrections')
-        analysis['recommendations'].append('✅ Good! Loss is negligible (<0.01%)')
-        analysis['recommendations'].append('Monitor-only mode should eliminate this completely')
-    elif loss_percentage < 0.1:
-        analysis['severity'] = 'LOW'
-        analysis['likely_causes'].append('Timing controller sending blocking commands')
-        analysis['likely_causes'].append('OS-level serial buffer limitations')
-        analysis['recommendations'].append('⚠️  Enable monitor-only mode to reduce loss')
-        analysis['recommendations'].append('Increase measurement interval to 30-60 seconds')
-        analysis['recommendations'].append('Check that non-blocking commands are enabled')
-    elif loss_percentage < 1.0:
-        analysis['severity'] = 'MODERATE'
-        analysis['likely_causes'].append('Frequent timing corrections blocking serial port')
-        analysis['likely_causes'].append('Insufficient serial buffer size')
-        analysis['likely_causes'].append('CPU/system load issues')
-        analysis['recommendations'].append('🔴 CRITICAL: Enable monitor-only mode immediately')
-        analysis['recommendations'].append('Set measurement_interval to 60 seconds')
-        analysis['recommendations'].append('Check system CPU load and reduce background tasks')
-        analysis['recommendations'].append('Consider disabling active timing corrections')
-    else:
-        analysis['severity'] = 'CRITICAL'
-        analysis['likely_causes'].append('Major system issue or connection problems')
-        analysis['likely_causes'].append('MCU resets or communication errors')
-        analysis['likely_causes'].append('Insufficient system resources')
-        analysis['recommendations'].append('🔴🔴 CRITICAL: Immediate action required!')
-        analysis['recommendations'].append('Disable all timing corrections immediately')
-        analysis['recommendations'].append('Check physical connections and power supply')
-        analysis['recommendations'].append('Review system logs for errors')
-        analysis['recommendations'].append('Consider hardware upgrade or dedicated system')
-    
-    return analysis
-
-
-def print_data_loss_report(analysis):
-    """Print a formatted data loss analysis report"""
-    print("\n" + "="*70)
-    print("📊 DATA LOSS ANALYSIS REPORT")
-    print("="*70)
-    print(f"Expected samples:  {analysis['expected_samples']:,}")
-    print(f"Actual samples:    {analysis['actual_samples']:,}")
-    print(f"Missing samples:   {analysis['missing_samples']:,}")
-    print(f"Loss percentage:   {analysis['loss_percentage']:.6f}%")
-    print(f"Severity:          {analysis['severity']}")
-    print()
-    
-    if analysis['likely_causes']:
-        print("Likely Causes:")
-        for cause in analysis['likely_causes']:
-            print(f"  • {cause}")
-        print()
-    
-    if analysis['recommendations']:
-        print("Recommendations:")
-        for rec in analysis['recommendations']:
-            print(f"  {rec}")
-    
-    print("="*70 + "\n")

@@ -199,7 +199,7 @@ config = app_config['device'] if app_config else {
     'send_g_units': False,
     'remove_mean': False,
     'chart_display_mode': 'raw',
-    'timestamp_quantization_ms': 10  # NEW: Configurable timestamp quantization
+    'timestamp_quantization_ms': 1  # FIXED: Changed from 10ms to 1ms to prevent timestamp collisions
 }
 
 # Add new options to existing config if they don't exist
@@ -214,7 +214,7 @@ if 'remove_mean' not in config:
 if 'chart_display_mode' not in config:
     config['chart_display_mode'] = 'raw'
 if 'timestamp_quantization_ms' not in config:
-    config['timestamp_quantization_ms'] = 10  # Default to 10ms quantization
+    config['timestamp_quantization_ms'] = 1  # FIXED: Changed from 10ms to 1ms to prevent timestamp collisions
 
 
 # Calibration constants for ±2g sensor
