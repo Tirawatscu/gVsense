@@ -42,3 +42,7 @@ nohup.out
 # OS
 .DS_Store
 Thumbs.db
+
+# Ignore device-specific configs
+config.conf
+*.conf
