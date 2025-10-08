@@ -471,29 +471,15 @@ class SimplifiedTimestampGenerator:
                 self.stats['last_timestamp'] = quantized_timestamp_ms / 1000.0
                 return quantized_timestamp_ms
             
-            # IMPROVED: Detect sequence resets before calculating differences
+            # SIMPLIFIED: Let MCU handle sequence validation
             if self.last_sequence is not None:
-                # Check for large backward jumps that indicate MCU reset
-                if sequence_number < self.last_sequence and (self.last_sequence - sequence_number) > 10000:
-                    print(f"🔄 MCU SEQUENCE RESET DETECTED: {self.last_sequence} -> {sequence_number}")
-                    print(f"   Large backward jump indicates MCU restart or reset")
-                    print(f"   Resetting timestamp generator state")
-                    
-                    # Reset the generator state
-                    self.reference_time = current_time
-                    self.reference_sequence = sequence_number
-                    self.stats['sequence_resets'] += 1
-                    
-                    # Return current time as new reference (with quantization)
-                    timestamp_s = current_time
-                else:
-                    # Calculate sequence progression (handle wraparound)
-                    sequence_diff = self._calculate_sequence_diff(
-                        self.reference_sequence, sequence_number
-                    )
-                    
-                    # Generate timestamp based on pure sequence progression
-                    timestamp_s = self.reference_time + (sequence_diff * self.expected_interval_s)
+                # Calculate sequence progression (let MCU handle validation)
+                sequence_diff = self._calculate_sequence_diff(
+                    self.reference_sequence, sequence_number
+                )
+                
+                # Generate timestamp based on pure sequence progression
+                timestamp_s = self.reference_time + (sequence_diff * self.expected_interval_s)
             else:
                 # First time with sequence tracking
                 timestamp_s = current_time
@@ -523,70 +509,45 @@ class SimplifiedTimestampGenerator:
             
     def _calculate_sequence_diff(self, ref_seq, current_seq):
         """
-        COMPLETELY REWRITTEN: Robust sequence handling with proper reset detection
-        Handles both 16-bit wraparound and MCU sequence resets correctly
+        SIMPLIFIED: Let MCU handle sequence validation, Python just follows
+        Eliminates conflicts between multiple sequence handling systems
         """
-        # CRITICAL FIX: If current sequence is much lower than reference, it's a reset
-        # This prevents the system from treating resets as wraparounds
-        if current_seq < ref_seq and (ref_seq - current_seq) > 10000:
-            print(f"🚨 SEQUENCE RESET DETECTED: {ref_seq} -> {current_seq}")
-            print(f"   Large backward jump ({ref_seq - current_seq}) indicates MCU reset")
-            print(f"   NOT a wraparound - resetting reference immediately")
-            
-            # Reset reference to current sequence
-            self.reference_sequence = current_seq
-            self.reference_time = time.time()
-            self.stats['sequence_resets'] += 1
-            return 0
+        # SIMPLIFIED APPROACH: Trust the MCU's sequence validation
+        # The MCU already handles sequence gaps, resets, and wraparounds
+        # Python should just calculate the difference without second-guessing
         
-        # Handle 16-bit wraparound correctly (only for forward progression)
+        # Handle 16-bit wraparound (0-65535)
         MAX_SEQUENCE = 65536
-        HALF_SEQUENCE = 32768
         
-        # Only calculate differences for forward progression
         if current_seq >= ref_seq:
             # Forward progression - normal case
             diff = current_seq - ref_seq
             
-            # CRITICAL FIX: Only detect wraparound if we're actually near the 16-bit boundary
-            # A jump from 1000 to 34000 is NOT a wraparound - it's a sequence reset!
+            # Check for wraparound only if we're near the boundary
             if ref_seq > 60000 and current_seq < 10000:
-                # This might be a true wraparound (near 65535 boundary)
+                # Potential wraparound near 65535 boundary
                 wraparound_diff = current_seq - (ref_seq + MAX_SEQUENCE)
                 if abs(wraparound_diff) < abs(diff):
                     diff = wraparound_diff
                     self.stats['wraparounds_detected'] += 1
-                    print(f"🔄 TRUE WRAPAROUND: {ref_seq} -> {current_seq} (diff: {diff})")
-            elif diff > HALF_SEQUENCE:
-                # Large forward jump - this is suspicious and likely a reset
-                print(f"⚠️  LARGE FORWARD JUMP: {ref_seq} -> {current_seq} (jump: {diff})")
-                print(f"   This is suspicious - might be a sequence reset")
-                print(f"   Resetting reference to be safe")
-                
-                # Reset reference to current sequence
-                self.reference_sequence = current_seq
-                self.reference_time = time.time()
-                self.stats['sequence_resets'] += 1
-                return 0
+                    print(f"🔄 WRAPAROUND: {ref_seq} -> {current_seq} (diff: {diff})")
             
             return diff
         else:
-            # Backward progression - this should NOT happen in normal operation
-            # If it's a small step, it might be a timing glitch
-            # If it's a large step, it's definitely a reset
-            step_size = ref_seq - current_seq
-            if step_size < 100:  # Small backward step - might be timing glitch
-                print(f"⚠️  SMALL BACKWARD STEP: {ref_seq} -> {current_seq} (step: {step_size})")
-                return 0  # Ignore small backward steps
-            else:  # Large backward step - definitely a reset
-                print(f"🚨 LARGE BACKWARD STEP: {ref_seq} -> {current_seq} (step: {step_size})")
-                print(f"   This indicates a sequence reset - resetting reference")
-                
-                # Reset reference
-                self.reference_sequence = current_seq
-                self.reference_time = time.time()
-                self.stats['sequence_resets'] += 1
-                return 0
+            # Backward progression - could be wraparound or reset
+            # Let MCU decide - Python just calculates the difference
+            diff = current_seq - (ref_seq - MAX_SEQUENCE)
+            
+            # If the wraparound-corrected diff is reasonable, use it
+            if 0 <= diff <= 1000:  # Reasonable forward progression
+                self.stats['wraparounds_detected'] += 1
+                print(f"🔄 WRAPAROUND: {ref_seq} -> {current_seq} (diff: {diff})")
+                return diff
+            else:
+                # Large backward jump - likely a reset, but let MCU handle it
+                print(f"⚠️  BACKWARD JUMP: {ref_seq} -> {current_seq}")
+                print(f"   MCU will handle sequence validation")
+                return 0  # Return 0 to avoid timestamp calculation errors
                 
     def update_rate(self, new_rate_hz):
         """Update expected rate (called when MCU rate is changed)"""
@@ -753,13 +714,8 @@ class UnifiedTimingController:
                 if buffer and len(buffer) > 0:
                     sample = buffer[-1]  # Most recent sample
                     
-                    # PROACTIVE: Check for sequence wraparound
-                    if hasattr(sample, 'sequence') and sample.get('sequence', 0) < 1000:
-                        # Sequence near 0 - check if this is a wraparound
-                        if hasattr(self, 'last_sequence') and self.last_sequence > 65000:
-                            print(f"🔄 PROACTIVE WRAPAROUND DETECTION: {self.last_sequence} -> {sample.get('sequence', 0)}")
-                            print(f"   Resetting sequence tracking to prevent massive errors")
-                            self.last_sequence = sample.get('sequence', 0)
+                    # SIMPLIFIED: Let MCU handle sequence validation
+                    # No proactive sequence checking - MCU already validates sequences
                     
                     return sample
         except:
@@ -771,19 +727,15 @@ class UnifiedTimingController:
         try:
             error_ms = error_data['filtered_error_ms']
             
-            # AGGRESSIVE SANITY CHECK: Prevent any large errors from sequence bugs
-            if abs(error_ms) > 100:  # More than 100ms error is suspicious
-                print(f"🚨 SANITY CHECK FAILED: Large error {error_ms:+.1f}ms detected!")
-                print(f"   This likely indicates a sequence reset or MCU restart")
-                print(f"   Error magnitude suggests sequence jumped from ~{abs(error_ms)//10} samples")
-                print(f"   Skipping correction to prevent system instability")
-                print(f"   System will recover when sequence stabilizes")
+            # SIMPLIFIED SANITY CHECK: Only prevent extremely large errors
+            if abs(error_ms) > 1000:  # More than 1 second error is definitely wrong
+                print(f"🚨 EXTREME ERROR: {error_ms:+.1f}ms - skipping correction")
+                print(f"   This is likely a system error, not a timing issue")
                 return
             
-            # ADDITIONAL CHECK: If error is still large but under 100ms, log it
-            if abs(error_ms) > 50:  # Log large errors for monitoring
-                print(f"⚠️  LARGE ERROR DETECTED: {error_ms:+.1f}ms")
-                print(f"   Monitoring for potential sequence issues")
+            # Log large errors for monitoring (but don't skip corrections)
+            if abs(error_ms) > 100:  # Log large errors for monitoring
+                print(f"⚠️  LARGE ERROR: {error_ms:+.1f}ms - applying correction")
             
             # Track error for performance analysis
             self.stats['error_history'].append({
