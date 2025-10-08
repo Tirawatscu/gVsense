@@ -509,13 +509,9 @@ class SimplifiedTimestampGenerator:
             
     def _calculate_sequence_diff(self, ref_seq, current_seq):
         """
-        SIMPLIFIED: Let MCU handle sequence validation, Python just follows
-        Eliminates conflicts between multiple sequence handling systems
+        ROBUST: Proper 16-bit wraparound handling for continuous operation
+        Handles the critical 65535 -> 0 transition correctly
         """
-        # SIMPLIFIED APPROACH: Trust the MCU's sequence validation
-        # The MCU already handles sequence gaps, resets, and wraparounds
-        # Python should just calculate the difference without second-guessing
-        
         # Handle 16-bit wraparound (0-65535)
         MAX_SEQUENCE = 65536
         
@@ -530,24 +526,35 @@ class SimplifiedTimestampGenerator:
                 if abs(wraparound_diff) < abs(diff):
                     diff = wraparound_diff
                     self.stats['wraparounds_detected'] += 1
-                    print(f"🔄 WRAPAROUND: {ref_seq} -> {current_seq} (diff: {diff})")
+                    print(f"🔄 WRAPAROUND DETECTED: {ref_seq} -> {current_seq} (diff: {diff})")
             
             return diff
         else:
             # Backward progression - could be wraparound or reset
-            # Let MCU decide - Python just calculates the difference
-            diff = current_seq - (ref_seq - MAX_SEQUENCE)
+            # CRITICAL FIX: Properly detect wraparound at 65535 -> 0 boundary
+            if ref_seq >= 65000 and current_seq <= 1000:
+                # This is likely a wraparound (65535 -> 0)
+                diff = current_seq - (ref_seq - MAX_SEQUENCE)
+                if 0 <= diff <= 1000:  # Reasonable forward progression
+                    self.stats['wraparounds_detected'] += 1
+                    print(f"🔄 WRAPAROUND DETECTED: {ref_seq} -> {current_seq} (diff: {diff})")
+                    return diff
             
-            # If the wraparound-corrected diff is reasonable, use it
-            if 0 <= diff <= 1000:  # Reasonable forward progression
-                self.stats['wraparounds_detected'] += 1
-                print(f"🔄 WRAPAROUND: {ref_seq} -> {current_seq} (diff: {diff})")
-                return diff
+            # Check if this is a large backward jump (likely reset)
+            step_size = ref_seq - current_seq
+            if step_size > 10000:  # Large backward jump - likely reset
+                print(f"🚨 SEQUENCE RESET DETECTED: {ref_seq} -> {current_seq} (step: {step_size})")
+                print(f"   Resetting timestamp generator state")
+                
+                # Reset the generator state
+                self.reference_sequence = current_seq
+                self.reference_time = time.time()
+                self.stats['sequence_resets'] += 1
+                return 0
             else:
-                # Large backward jump - likely a reset, but let MCU handle it
-                print(f"⚠️  BACKWARD JUMP: {ref_seq} -> {current_seq}")
-                print(f"   MCU will handle sequence validation")
-                return 0  # Return 0 to avoid timestamp calculation errors
+                # Small backward step - might be timing glitch, ignore
+                print(f"⚠️  SMALL BACKWARD STEP: {ref_seq} -> {current_seq} (step: {step_size})")
+                return 0
                 
     def update_rate(self, new_rate_hz):
         """Update expected rate (called when MCU rate is changed)"""
@@ -601,6 +608,27 @@ class SimplifiedTimestampGenerator:
             self.stats['last_timestamp'] = None
             
             print(f"✅ Generator reset complete - ready for fresh start")
+    
+    def force_wraparound_recovery(self, current_sequence):
+        """Force recovery from stuck sequence state (e.g., after 65535)"""
+        with self.lock:
+            print(f"🔧 FORCING WRAPAROUND RECOVERY")
+            print(f"   Current sequence: {current_sequence}")
+            print(f"   Last sequence: {self.last_sequence}")
+            print(f"   Reference sequence: {self.reference_sequence}")
+            
+            # Reset to current sequence and reinitialize
+            self.reference_sequence = current_sequence
+            self.reference_time = time.time()
+            self.last_sequence = current_sequence
+            self.is_initialized = True
+            
+            # Update stats
+            self.stats['sequence_resets'] += 1
+            self.stats['last_sequence'] = current_sequence
+            self.stats['max_sequence_seen'] = max(self.stats['max_sequence_seen'], current_sequence)
+            
+            print(f"✅ Wraparound recovery complete - reset to sequence {current_sequence}")
 
 
 class UnifiedTimingController:
