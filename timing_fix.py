@@ -30,15 +30,15 @@ class UnifiedTimingManager:
         self.master_drift_ppm = 0.0  # Current drift rate
         self.last_measurement_time = 0.0
         
-        # Single Kalman filter for unified state estimation
+        # Single Kalman filter for unified state estimation - OPTIMIZED FOR STABILITY
         self.kalman_state = {
             'offset_ms': 0.0,
             'drift_rate_ppm': 0.0,
-            'offset_variance': 100.0,
-            'drift_variance': 1.0,
-            'process_noise_offset': 0.5,
-            'process_noise_drift': 0.05,
-            'measurement_noise': 1.0
+            'offset_variance': 10.0,        # Much more conservative for stability
+            'drift_variance': 0.1,           # Much more conservative for stability
+            'process_noise_offset': 0.05,   # Much more conservative to prevent oscillations
+            'process_noise_drift': 0.001,   # Much more conservative for smoother adaptation
+            'measurement_noise': 2.0        # Much more conservative - trust measurements less
         }
         
         # Control strategy selection
@@ -718,10 +718,10 @@ class UnifiedTimingController:
         self.controller_thread = None
         self.start_time = None  # Will be set when controller starts
         
-        # Control parameters - OPTIMIZED for ±0.5ms target
-        self.measurement_interval_s = 1.0  # Measure every 1 second (faster response with PPS)
-        self.target_error_ms = 0.5        # Desired steady-state absolute error (±0.5ms)
-        self.min_error_threshold_ms = 0.2 # Deadband to avoid chattering (±0.2ms)
+        # Control parameters - OPTIMIZED for minimal offset error fluctuations
+        self.measurement_interval_s = 0.5  # Measure every 0.5 seconds (faster response)
+        self.target_error_ms = 0.3        # Desired steady-state absolute error (±0.3ms)
+        self.min_error_threshold_ms = 0.1 # Deadband to avoid chattering (±0.1ms)
         
         # MCU control state
         self.current_mcu_interval_us = 10000.0  # 100Hz default
@@ -885,14 +885,14 @@ class UnifiedTimingController:
         - If error_ms < 0: timestamps behind GPS → MCU too slow → need NEGATIVE ppm to speed up
         """
         try:
-            # OPTIMIZED: Adaptive correction strength based on error magnitude (sub-ms precision)
+            # OPTIMIZED: Adaptive correction strength for minimal fluctuations
             error_abs = abs(error_ms)
-            if error_abs > 10.0:       # >10ms error: aggressive but safe
-                correction_ppm = +error_ms * 2.0
-            elif error_abs > 1.0:      # 1..10ms: moderate
-                correction_ppm = +error_ms * 1.0
+            if error_abs > 5.0:        # >5ms error: moderate correction (reduced from 10ms)
+                correction_ppm = +error_ms * 1.5  # Reduced from 2.0 for stability
+            elif error_abs > 1.0:      # 1..5ms: gentle correction
+                correction_ppm = +error_ms * 0.8  # Reduced from 1.0 for stability
             else:                      # <1ms: very gentle to avoid oscillation
-                correction_ppm = +error_ms * 0.4
+                correction_ppm = +error_ms * 0.3  # Reduced from 0.4 for stability
             
             # Limit correction
             max_correction = strategy['max_correction']
@@ -904,8 +904,8 @@ class UnifiedTimingController:
             correction_factor = 1.0 + (correction_ppm / 1e6)
             new_interval_us = self.current_mcu_interval_us * correction_factor
             
-            # Clamp to reasonable range
-            new_interval_us = max(9000, min(11000, new_interval_us))
+            # Clamp to tighter range for better stability
+            new_interval_us = max(9500, min(10500, new_interval_us))
             
             # Diagnostic output
             old_rate = 1e6 / self.current_mcu_interval_us
@@ -940,13 +940,13 @@ class UnifiedTimingController:
             # For host corrections, we want to adjust timestamps to compensate for error
             # If error_ms > 0: timestamps ahead → subtract from future timestamps
             # If error_ms < 0: timestamps behind → add to future timestamps
-            # Dynamic host correction scaling for sub-ms stability
-            if abs(error_ms) > 5.0:
-                scale = 0.5
+            # OPTIMIZED host correction scaling for minimal fluctuations
+            if abs(error_ms) > 3.0:      # Reduced threshold for earlier intervention
+                scale = 0.3              # Reduced from 0.5 for stability
             elif abs(error_ms) > 1.0:
-                scale = 0.4
+                scale = 0.25             # Reduced from 0.4 for stability
             else:
-                scale = 0.2
+                scale = 0.15            # Reduced from 0.2 for stability
             correction = -error_ms * scale
             
             # Limit correction

@@ -713,6 +713,32 @@
                             </span>
                         </div>
                     </div>
+
+                    <!-- Adaptive Controller Controls -->
+                    <div style="border-top: 1px solid #333; margin-top: 12px; padding-top: 12px;">
+                        <div class="config-group">
+                            <label for="adaptive-meas-interval">Measurement Interval (s)</label>
+                            <input type="number" id="adaptive-meas-interval" min="0.2" max="10" step="0.1" value="0.5">
+                        </div>
+                        <div class="config-group">
+                            <label for="adaptive-target-ms">Target Error (ms)</label>
+                            <input type="number" id="adaptive-target-ms" min="0.1" max="20" step="0.1" value="2.0">
+                        </div>
+                        <div class="config-group">
+                            <label for="adaptive-deadband-ms">Deadband (ms)</label>
+                            <input type="number" id="adaptive-deadband-ms" min="0.05" max="5" step="0.05" value="0.5">
+                        </div>
+                        <div class="config-group">
+                            <label for="adaptive-max-ppm">Max Correction (ppm)</label>
+                            <input type="number" id="adaptive-max-ppm" min="10" max="1000" step="10" value="300">
+                        </div>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                            <button class="btn btn-small" onclick="applyAdaptiveConfig()">Apply Adaptive Config</button>
+                            <button id="adaptive-toggle-btn" class="btn btn-small" onclick="toggleAdaptiveController()">Enable Controller</button>
+                            <button class="btn btn-small" onclick="forceBaseline()">Force MCU Baseline</button>
+                            <button class="btn btn-small" onclick="loadAdaptiveConfig()">Load Current</button>
+                        </div>
+                    </div>
                 </div>
                 
                 <!-- Data Quality Panel -->
@@ -1320,6 +1346,93 @@
         }
         
         // Control functions
+        async function loadAdaptiveConfig() {
+            try {
+                const resp = await fetch('/api/adaptive/status');
+                const data = await resp.json();
+                if (resp.ok && data) {
+                    const meas = (typeof data.measurement_interval_s === 'number') ? data.measurement_interval_s : 0.5;
+                    document.getElementById('adaptive-meas-interval').value = meas.toFixed(1);
+                    // Defaults for others based on common current setup
+                    document.getElementById('adaptive-target-ms').value = 2.0;
+                    document.getElementById('adaptive-deadband-ms').value = 0.5;
+                    document.getElementById('adaptive-max-ppm').value = (typeof data.max_correction_ppm === 'number') ? data.max_correction_ppm : 300;
+                    const btn = document.getElementById('adaptive-toggle-btn');
+                    if (data.enabled && data.running) {
+                        btn.textContent = 'Disable Controller';
+                    } else {
+                        btn.textContent = 'Enable Controller';
+                    }
+                }
+            } catch (e) {
+                console.warn('Failed to load adaptive config', e);
+            }
+        }
+
+        async function applyAdaptiveConfig() {
+            try {
+                const payload = {
+                    measurement_interval_s: parseFloat(document.getElementById('adaptive-meas-interval').value),
+                    target_error_ms: parseFloat(document.getElementById('adaptive-target-ms').value),
+                    min_error_threshold_ms: parseFloat(document.getElementById('adaptive-deadband-ms').value),
+                    max_correction_ppm: parseFloat(document.getElementById('adaptive-max-ppm').value)
+                };
+                const resp = await fetch('/api/adaptive/config', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+                });
+                if (resp.ok) {
+                    const res = await resp.json();
+                    alert(`Adaptive config applied: ${res.message || 'OK'}`);
+                    await updateStatus();
+                } else {
+                    const err = await resp.json();
+                    alert(`Failed to apply adaptive config: ${err.message || 'Unknown error'}`);
+                }
+            } catch (e) {
+                console.error('applyAdaptiveConfig error:', e);
+                alert('Error applying adaptive configuration');
+            }
+        }
+
+        async function toggleAdaptiveController() {
+            try {
+                const statusResp = await fetch('/api/adaptive/status');
+                const status = await statusResp.json();
+                const enable = !(status.enabled && status.running);
+                const resp = await fetch('/api/adaptive/enable', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enable })
+                });
+                if (resp.ok) {
+                    const res = await resp.json();
+                    alert(res.message || (enable ? 'Controller enabled' : 'Controller disabled'));
+                    const btn = document.getElementById('adaptive-toggle-btn');
+                    btn.textContent = enable ? 'Disable Controller' : 'Enable Controller';
+                    await updateStatus();
+                } else {
+                    const err = await resp.json();
+                    alert(`Failed to toggle controller: ${err.message || 'Unknown error'}`);
+                }
+            } catch (e) {
+                console.error('toggleAdaptiveController error:', e);
+                alert('Error toggling controller');
+            }
+        }
+
+        async function forceBaseline() {
+            try {
+                const resp = await fetch('/api/adaptive/force_baseline', { method: 'POST' });
+                const res = await resp.json();
+                if (resp.ok) {
+                    alert(res.message || 'MCU forced to baseline');
+                    await updateStatus();
+                } else {
+                    alert(`Failed to force baseline: ${res.message || 'Unknown error'}`);
+                }
+            } catch (e) {
+                console.error('forceBaseline error:', e);
+                alert('Error forcing baseline');
+            }
+        }
         async function toggleStream() {
             try {
                 const action = streaming ? 'stop' : 'start';
@@ -1824,6 +1937,7 @@
         // Initialize
         initCharts();
         updateStatus();
+        loadAdaptiveConfig();
         syncServerTime();
         // No automatic filter status - filters are set manually like other settings
         

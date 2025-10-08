@@ -1850,15 +1850,15 @@ class HostTimingManager:
         self.pll_last_update = 0.0
         self.pll_update_interval_s = 0.5  # Update every 500ms for faster response
         
-        # Kalman filter state for robust estimation - AGGRESSIVE TUNING
+        # Kalman filter state for robust estimation - OPTIMIZED FOR STABILITY
         self.kalman_state = {
             'offset_ms': 0.0,      # Current offset estimate
             'drift_rate_ppm': 0.0,  # Current drift rate estimate
-            'offset_variance': 25.0,     # Reduced uncertainty for faster response
-            'drift_variance': 0.25,      # Reduced uncertainty for faster convergence
-            'process_noise_offset': 0.1,     # Increased process noise for faster adaptation
-            'process_noise_drift': 0.01,     # Increased drift noise for faster learning
-            'measurement_noise': 0.5,        # Reduced measurement noise (trust measurements more)
+            'offset_variance': 15.0,     # Further reduced for faster response
+            'drift_variance': 0.15,     # Further reduced for better convergence
+            'process_noise_offset': 0.05,     # Further reduced for stability
+            'process_noise_drift': 0.005,     # Further reduced for smoother adaptation
+            'measurement_noise': 0.3,         # Further reduced for better trust
             'last_prediction_time': 0.0
         }
         
