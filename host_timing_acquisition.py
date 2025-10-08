@@ -1161,6 +1161,19 @@ class HostTimingSeismicAcquisition:
                 accuracy_us = float(parts[3].strip())
                 values = [int(parts[i].strip()) for i in range(4, len(parts))]
                 
+                # CRITICAL FIX: Global wraparound detection in data pipeline
+                if hasattr(self, '_last_processed_sequence') and self._last_processed_sequence is not None:
+                    if self._last_processed_sequence == 65535 and sequence == 0:
+                        print(f"🚨 GLOBAL WRAPAROUND DETECTION IN DATA PIPELINE: {self._last_processed_sequence} -> {sequence}")
+                        print(f"   Forcing timestamp generator recovery to prevent data loss")
+                        
+                        # Force wraparound recovery in timestamp generator
+                        if hasattr(self.timing_adapter, 'timestamp_generator'):
+                            self.timing_adapter.timestamp_generator.force_wraparound_recovery(sequence)
+                            print(f"   Timestamp generator recovery completed")
+                
+                self._last_processed_sequence = sequence
+                
                 # CRITICAL: Generate host timestamp using UNIFIED timing system ONLY
                 host_timestamp = self.timing_adapter.generate_timestamp(sequence)
                 
@@ -1215,6 +1228,19 @@ class HostTimingSeismicAcquisition:
                 if len(parts) >= 2:  # At least sequence and one value
                     sequence = int(parts[0].strip())
                     values = [int(parts[i].strip()) for i in range(1, len(parts))]
+                    
+                    # CRITICAL FIX: Global wraparound detection in fallback data pipeline
+                    if hasattr(self, '_last_processed_sequence') and self._last_processed_sequence is not None:
+                        if self._last_processed_sequence == 65535 and sequence == 0:
+                            print(f"🚨 GLOBAL WRAPAROUND DETECTION IN FALLBACK PIPELINE: {self._last_processed_sequence} -> {sequence}")
+                            print(f"   Forcing timestamp generator recovery to prevent data loss")
+                            
+                            # Force wraparound recovery in timestamp generator
+                            if hasattr(self.timing_adapter, 'timestamp_generator'):
+                                self.timing_adapter.timestamp_generator.force_wraparound_recovery(sequence)
+                                print(f"   Timestamp generator recovery completed")
+                    
+                    self._last_processed_sequence = sequence
                     
                     # CRITICAL: Generate host timestamp using UNIFIED timing system ONLY
                     host_timestamp = self.timing_adapter.generate_timestamp(sequence)

@@ -210,6 +210,37 @@ class UnifiedTimingManager:
             try:
                 current_time = time.time()
                 
+                # CRITICAL FIX: Proactive wraparound detection
+                # Check if we're dealing with a sequence that suggests wraparound occurred
+                if hasattr(self, '_last_sequence_checked'):
+                    if self._last_sequence_checked > 65000 and sample_sequence < 1000:
+                        print(f"🚨 PROACTIVE WRAPAROUND DETECTION: {self._last_sequence_checked} -> {sample_sequence}")
+                        print(f"   Detected wraparound in timing manager - resetting state")
+                        
+                        # Reset timing state to prevent extreme errors
+                        self.kalman_state['offset_ms'] = 0.0
+                        self.kalman_state['drift_rate_ppm'] = 0.0
+                        self.kalman_state['offset_variance'] = 100.0
+                        self.kalman_state['drift_variance'] = 1.0
+                        
+                        # Clear correction history to prevent contamination
+                        self.correction_history.clear()
+                        
+                        print(f"   Timing state reset - extreme errors prevented")
+                        
+                        # Also try to reset the timestamp generator if it exists
+                        # This is a safety measure in case the generator is stuck
+                        try:
+                            if hasattr(self, '_timestamp_generator_ref'):
+                                generator = self._timestamp_generator_ref()
+                                if generator:
+                                    generator.force_wraparound_recovery(sample_sequence)
+                                    print(f"   Timestamp generator also reset")
+                        except Exception as e:
+                            print(f"   Warning: Could not reset timestamp generator: {e}")
+                
+                self._last_sequence_checked = sample_sequence
+                
                 # Get reference time
                 reference_time = self.get_reference_time()
                 
@@ -459,6 +490,36 @@ class SimplifiedTimestampGenerator:
             self.stats['samples_processed'] += 1
             current_time = time.time()
             
+            # CRITICAL FIX: Proactive wraparound detection at the entry point
+            if self.is_initialized and self.last_sequence is not None:
+                if self.last_sequence > 65000 and sequence_number < 1000:
+                    print(f"🚨 PROACTIVE WRAPAROUND DETECTION IN GENERATOR: {self.last_sequence} -> {sequence_number}")
+                    print(f"   Forcing wraparound recovery to prevent data loss")
+                    
+                    # Force wraparound recovery
+                    self.force_wraparound_recovery(sequence_number)
+                    
+                    # Generate timestamp using current time
+                    timestamp_ms = int(current_time * 1000)
+                    quantized_timestamp_ms = round(timestamp_ms / self.quantization_ms) * self.quantization_ms
+                    self.stats['last_timestamp'] = quantized_timestamp_ms / 1000.0
+                    return quantized_timestamp_ms
+            
+            # ADDITIONAL FIX: Check for sequence 65535 -> 0 transition
+            if self.is_initialized and self.last_sequence is not None:
+                if self.last_sequence == 65535 and sequence_number == 0:
+                    print(f"🚨 DIRECT WRAPAROUND DETECTION: {self.last_sequence} -> {sequence_number}")
+                    print(f"   Detected exact 65535 -> 0 transition")
+                    
+                    # Force wraparound recovery
+                    self.force_wraparound_recovery(sequence_number)
+                    
+                    # Generate timestamp using current time
+                    timestamp_ms = int(current_time * 1000)
+                    quantized_timestamp_ms = round(timestamp_ms / self.quantization_ms) * self.quantization_ms
+                    self.stats['last_timestamp'] = quantized_timestamp_ms / 1000.0
+                    return quantized_timestamp_ms
+            
             # Initialize on first sample
             if not self.is_initialized:
                 self.reference_time = current_time
@@ -478,8 +539,14 @@ class SimplifiedTimestampGenerator:
                     self.reference_sequence, sequence_number
                 )
                 
-                # Generate timestamp based on pure sequence progression
-                timestamp_s = self.reference_time + (sequence_diff * self.expected_interval_s)
+                # CRITICAL FIX: If sequence_diff is -1, it means wraparound was detected
+                # Use current time as base to prevent massive timestamp jumps
+                if sequence_diff == -1:
+                    # Wraparound detected - use current time as base
+                    timestamp_s = current_time
+                else:
+                    # Generate timestamp based on pure sequence progression
+                    timestamp_s = self.reference_time + (sequence_diff * self.expected_interval_s)
             else:
                 # First time with sequence tracking
                 timestamp_s = current_time
@@ -538,7 +605,15 @@ class SimplifiedTimestampGenerator:
                 if 0 <= diff <= 1000:  # Reasonable forward progression
                     self.stats['wraparounds_detected'] += 1
                     print(f"🔄 WRAPAROUND DETECTED: {ref_seq} -> {current_seq} (diff: {diff})")
-                    return diff
+                    print(f"   Updating reference sequence to prevent timestamp jumps")
+                    
+                    # CRITICAL: Update reference sequence to prevent future timestamp errors
+                    self.reference_sequence = current_seq
+                    self.reference_time = time.time()
+                    
+                    # CRITICAL FIX: Return -1 to signal wraparound detected
+                    # This will trigger special handling in timestamp generation
+                    return -1
             
             # Check if this is a large backward jump (likely reset)
             step_size = ref_seq - current_seq
