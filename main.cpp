@@ -2,6 +2,7 @@
 #include <math.h>
 #include <ADS126X.h>
 #include <SPI.h>
+#include <EEPROM.h>
 
 // Global variables
 ADS126X adc;
@@ -16,18 +17,37 @@ uint8_t current_adc_filter = ADS126X_SINC3;  // Default to SINC3 filter
 uint8_t current_dithering = 4;               // Default to 4x oversampling
 int num_channels = 3;
 
+// ADC throughput verification
+struct ADCThroughputMonitor {
+  uint32_t deadline_misses;
+  uint32_t max_conversion_time_us;
+  uint32_t min_conversion_time_us;
+  uint32_t total_conversions;
+  bool throughput_warning_sent;
+} adc_monitor;
+
 // Streaming settings
 volatile bool streaming = false;
 float stream_rate = 100.0;
 uint16_t sequence = 0;  // 16-bit sequence (0-65535)
 
-// Serial buffer overflow protection
+// Session tracking for stitching
+struct SessionTracker {
+  uint32_t boot_id;      // Unique ID for this MCU boot cycle
+  uint32_t stream_id;    // Unique ID for this streaming session
+  bool session_header_sent;
+} session_tracker;
+
+// Serial buffer overflow protection with backpressure signaling
 struct SerialBufferMonitor {
   uint32_t buffer_overflows;
   uint32_t last_overflow_time;
   uint32_t bytes_sent;
   uint32_t samples_skipped_due_to_overflow;
   bool overflow_warning_sent;
+  uint32_t oflow_message_count;
+  uint32_t last_oflow_message_time;
+  uint32_t oflow_report_interval_ms;  // Report OFLOW every N ms
 } serial_monitor;
 
 // Output format options
@@ -63,7 +83,7 @@ struct AdvancedTiming {
     
     // Calibration Data
     float oscillator_calibration_ppm;   // PPM correction from PPS
-    unsigned long cal_base_micros;      // MCU micros() when calibration established
+    uint64_t cal_base_micros;          // MCU micros() when calibration established (64-bit)
     unsigned long cal_base_millis;      // millis() when calibration established
     uint32_t cal_sample_count;          // Samples since calibration
     bool calibration_valid;
@@ -121,6 +141,16 @@ struct AdvancedTiming {
     uint32_t pps_miss_count;       // Consecutive missed PPS
     unsigned long last_sync_time;   // Last successful sync
     uint32_t clock_resets_detected; // Total clock resets detected
+    
+    // Health beacon (1 Hz STAT line)
+    unsigned long last_stat_time;   // Last STAT line sent
+    uint32_t stat_interval_ms;      // STAT line interval (1000ms = 1Hz)
+    
+    // Temperature-aware calibration
+    float temp_coefficient_ppm_per_c;  // PPM change per degree C
+    float reference_temp_c;            // Reference temperature for calibration
+    float current_temp_c;              // Current temperature
+    bool temp_compensation_enabled;    // Enable temperature compensation
 } advanced_timing;
 
 // Channel definitions
@@ -139,7 +169,7 @@ void pps_interrupt();
 void updateTimingSource();
 void processPPS();
 uint64_t getPreciseTimestamp();
-uint64_t calculateCalibratedTimestamp(unsigned long current_micros);
+uint64_t calculateCalibratedTimestamp(uint64_t current_micros);
 void establishSamplingTiming();
 void generatePreciseSample();
 bool checkSyncStartTime();
@@ -151,6 +181,15 @@ void updateTimingReference();
 bool checkSerialBufferOverflow();
 void outputDataWithOverflowProtection(uint16_t seq, uint64_t timestamp, int timing_source, float accuracy, long v1, long v2, long v3);
 bool validateAndCorrectSequence(uint16_t& seq);
+bool verifyADCThroughput();
+void sendSessionHeader();
+void clampOscillatorCalibration();
+void sendHealthBeacon();
+bool isRateChangeAllowed(float new_rate);
+void saveOscillatorCalibration();
+void loadOscillatorCalibration();
+float readInternalTemperature();
+void updateTemperatureCompensation();
 
 void setup() {
   Serial1.begin(921600);  // INCREASED from 115200 to prevent buffer overflow (8x faster)
@@ -162,6 +201,9 @@ void setup() {
   serial_monitor.bytes_sent = 0;
   serial_monitor.samples_skipped_due_to_overflow = 0;
   serial_monitor.overflow_warning_sent = false;
+  serial_monitor.oflow_message_count = 0;
+  serial_monitor.last_oflow_message_time = 0;
+  serial_monitor.oflow_report_interval_ms = 1000;  // Report OFLOW every 1 second
   
   // Initialize sequence validator
   seq_validator.expected_sequence = 0;
@@ -170,7 +212,22 @@ void setup() {
   seq_validator.last_validation_time = 0;
   seq_validator.validation_enabled = true;
   
+  // Initialize ADC throughput monitor
+  adc_monitor.deadline_misses = 0;
+  adc_monitor.max_conversion_time_us = 0;
+  adc_monitor.min_conversion_time_us = 0;
+  adc_monitor.total_conversions = 0;
+  adc_monitor.throughput_warning_sent = false;
+  
+  // Initialize session tracker
+  session_tracker.boot_id = millis();  // Use boot time as boot_id
+  session_tracker.stream_id = 0;
+  session_tracker.session_header_sent = false;
+  
   setupAdvancedTiming();
+  
+  // Load stored oscillator calibration from EEPROM
+  loadOscillatorCalibration();
   
   // Initialize SPI and ADC
   SPI.begin();
@@ -204,6 +261,12 @@ void loop() {
   
   // Update timing source status
   updateTimingSource();
+  
+  // Send health beacon (1 Hz STAT line)
+  sendHealthBeacon();
+  
+  // Update temperature compensation (if enabled)
+  updateTemperatureCompensation();
   
   // Process serial commands
   while (Serial1.available()) {
@@ -265,10 +328,22 @@ void loop() {
     advanced_timing.effective_interval_us = (double)advanced_timing.sample_interval_us *
       (1.0 - (advanced_timing.oscillator_calibration_ppm / 1e6));
 
-    // Schedule: if it's time, produce a sample and advance by effective interval
+    // Single-shot scheduler: emit max 1 sample per loop, skip over missed slots
     uint64_t now_virtual = getVirtualMicros();
-    while ((long long)now_virtual - (long long)advanced_timing.next_sample_micros >= 0) {
+    if ((long long)now_virtual - (long long)advanced_timing.next_sample_micros >= 0) {
       generatePreciseSample();
+
+      // Skip-ahead: calculate how many slots we missed and jump over them
+      long long missed_slots = ((long long)now_virtual - (long long)advanced_timing.next_sample_micros) / 
+                               (long long)advanced_timing.effective_interval_us;
+      
+      if (missed_slots > 0) {
+        // Jump over missed slots to prevent burst catch-up
+        advanced_timing.next_sample_micros += (uint64_t)(missed_slots * (long long)advanced_timing.effective_interval_us);
+        Serial1.print("DEBUG:Skipped ");
+        Serial1.print(missed_slots);
+        Serial1.println(" missed slots");
+      }
 
       // Advance next time with fractional accumulator to keep long-term average exact
       double step = advanced_timing.effective_interval_us + advanced_timing.phase_acc_us;
@@ -288,7 +363,6 @@ void loop() {
       long long whole_us = (long long)step;
       advanced_timing.phase_acc_us = step - (double)whole_us; // keep fractional part
       advanced_timing.next_sample_micros += (uint64_t)whole_us;
-      now_virtual = getVirtualMicros();
     }
   }
   
@@ -360,6 +434,16 @@ void setupAdvancedTiming() {
   advanced_timing.phase_adjust_samples_remaining = 0;
   advanced_timing.pps_phase_lock_enabled = true;
   
+  // Initialize health beacon
+  advanced_timing.last_stat_time = 0;
+  advanced_timing.stat_interval_ms = 1000;  // 1 Hz
+  
+  // Initialize temperature-aware calibration
+  advanced_timing.temp_coefficient_ppm_per_c = 0.0;  // Will be learned from PPS
+  advanced_timing.reference_temp_c = 25.0;            // Reference temperature
+  advanced_timing.current_temp_c = 25.0;              // Current temperature
+  advanced_timing.temp_compensation_enabled = false;  // Disabled until learned
+  
   Serial1.println("DEBUG:Advanced timing system initialized with overflow protection");
 }
 
@@ -387,29 +471,32 @@ void updateTimingSource() {
   unsigned long time_since_reset = current_millis - advanced_timing.reset_detection_time;
   bool recent_reset = advanced_timing.clock_reset_detected && (time_since_reset < 30000); // 30 seconds
   
-  // Determine current timing source based on PPS health and reset status
+  // Determine current timing source based on explicit thresholds
   unsigned long time_since_pps = current_millis - advanced_timing.last_pps_time;
   
+  // Explicit state machine thresholds as specified
   if (advanced_timing.pps_valid && time_since_pps < 1500 && !recent_reset) {
-    // PPS is active and recent, no recent reset
+    // ACTIVE: last_pps_age < 1.5s
     advanced_timing.current_source = AdvancedTiming::TIMING_PPS_ACTIVE;
     advanced_timing.timing_accuracy_us = 1.0;  // ±1μs with active PPS
     advanced_timing.pps_miss_count = 0;
   }
   else if (advanced_timing.pps_valid && time_since_pps < 60000 && !recent_reset) {
-    // PPS was recent, use holdover with prediction
+    // HOLDOVER: 1.5s < last_pps_age < 60s (no PPS but have oscillator_calibration_ppm)
     advanced_timing.current_source = AdvancedTiming::TIMING_PPS_HOLDOVER;
-    // Accuracy degrades over time without PPS
+    // Freeze ppm in holdover, slowly increase accuracy_us
+    // oscillator_calibration_ppm remains frozen at last good value
     advanced_timing.timing_accuracy_us = 1.0 + (time_since_pps / 1000.0) * 0.1;  // +0.1μs per second
     advanced_timing.pps_miss_count++;
   }
   else if (advanced_timing.calibration_valid && time_since_pps < 300000 && !recent_reset) {
-    // Use calibrated oscillator (good for ~5 minutes)
+    // CAL: 60s < last_pps_age < 300s (or if temp change > threshold)
     advanced_timing.current_source = AdvancedTiming::TIMING_INTERNAL_CAL;
+    // Keep the last ppm and slowly increase accuracy_us
     advanced_timing.timing_accuracy_us = 10.0 + (time_since_pps / 1000.0) * 0.3;  // +0.3μs per second
   }
   else {
-    // Fall back to raw internal oscillator
+    // RAW: last_pps_age > 300s (or if temp change > threshold)
     advanced_timing.current_source = AdvancedTiming::TIMING_INTERNAL_RAW;
     advanced_timing.timing_accuracy_us = recent_reset ? 2000.0 : 1000.0;  // Worse accuracy after reset
     
@@ -567,7 +654,7 @@ uint64_t getPreciseTimestamp() {
     case AdvancedTiming::TIMING_PPS_HOLDOVER:
     case AdvancedTiming::TIMING_INTERNAL_CAL:
       // Use calibrated timestamp with virtual time
-      return calculateCalibratedTimestamp((unsigned long)(virtual_micros & 0xFFFFFFFF));
+      return calculateCalibratedTimestamp(virtual_micros);
       
     case AdvancedTiming::TIMING_INTERNAL_RAW:
     default:
@@ -594,6 +681,7 @@ void processPPS() {
       advanced_timing.started_on_pps = true;
       sequence = 0;
       streaming = true;
+      sendSessionHeader();
       Serial1.print("OK:Streaming started at PPS with ");
       Serial1.print(stream_rate);
       Serial1.println("Hz");
@@ -625,14 +713,9 @@ void processPPS() {
   // Calculate oscillator calibration (only if no recent reset)
   if (advanced_timing.pps_count > 1 && advanced_timing.calibration_valid && !advanced_timing.clock_reset_detected) {
     // Expected time since last PPS: 1,000,000 μs
-    unsigned long actual_interval = pps_micros - advanced_timing.cal_base_micros;
+    uint64_t actual_interval = pps_micros - advanced_timing.cal_base_micros;
     
-    // Handle potential micros() wraparound in interval calculation
-    if (pps_micros < advanced_timing.cal_base_micros) {
-      // Wraparound occurred, adjust calculation
-      actual_interval = (4294967295UL - advanced_timing.cal_base_micros) + pps_micros + 1;
-    }
-    
+    // No wraparound handling needed with 64-bit arithmetic
     float error_ppm = ((float)actual_interval - 1000000.0) / 1000000.0 * 1e6;
     
     // Only update calibration if error seems reasonable
@@ -645,6 +728,29 @@ void processPPS() {
         // Smooth calibration updates (10% new, 90% old)
         advanced_timing.oscillator_calibration_ppm = 
           0.9 * advanced_timing.oscillator_calibration_ppm + 0.1 * (-error_ppm);
+        
+        // Apply hard limits and sanity checks
+        clampOscillatorCalibration();
+        
+        // Save calibration to EEPROM for future boots
+        saveOscillatorCalibration();
+        
+        // Learn temperature coefficient if we have enough PPS data
+        if (advanced_timing.pps_count > 100 && advanced_timing.pps_count % 50 == 0) {
+          float current_temp = readInternalTemperature();
+          float temp_change = current_temp - advanced_timing.reference_temp_c;
+          
+          if (abs(temp_change) > 1.0) {  // Only learn if temperature changed significantly
+            // Simple linear learning: assume ppm change is proportional to temp change
+            float ppm_change = advanced_timing.oscillator_calibration_ppm - 0.0; // Relative to reference
+            advanced_timing.temp_coefficient_ppm_per_c = ppm_change / temp_change;
+            advanced_timing.temp_compensation_enabled = true;
+            
+            Serial1.print("DEBUG:Learned temperature coefficient: ");
+            Serial1.print(advanced_timing.temp_coefficient_ppm_per_c, 3);
+            Serial1.println(" ppm/°C");
+          }
+        }
       }
       
       // Report calibration periodically
@@ -694,8 +800,9 @@ void processPPS() {
         // Spread correction over up to 200 samples, but cap per-sample adjust to +/-50us
         uint32_t planned_samples = 200;
         double per_sample = (double)signed_phase / (double)planned_samples;
-        if (per_sample > 50.0) per_sample = 50.0;
-        if (per_sample < -50.0) per_sample = -50.0;
+        // Cap per-sample adjustment to ±20 μs/sample clamp
+        if (per_sample > 20.0) per_sample = 20.0;
+        if (per_sample < -20.0) per_sample = -20.0;
         // Recompute number of samples to achieve full correction with capped per-sample
         uint32_t samples_needed = (uint32_t)( (fabs((double)signed_phase) / (fabs(per_sample) > 0.0 ? fabs(per_sample) : 1.0)) + 0.5 );
         if (samples_needed == 0) samples_needed = 1;
@@ -765,6 +872,7 @@ void processPPS() {
       advanced_timing.started_on_pps = true;
       sequence = 0;
       streaming = true;
+      sendSessionHeader();
       Serial1.print("OK:Streaming started at PPS with ");
       Serial1.print(stream_rate);
       Serial1.println("Hz");
@@ -777,22 +885,17 @@ void processPPS() {
   }
 }
 
-uint64_t calculateCalibratedTimestamp(unsigned long current_micros) {
+uint64_t calculateCalibratedTimestamp(uint64_t current_micros) {
   if (!advanced_timing.calibration_valid) {
     return current_micros;
   }
   
-  // Apply oscillator calibration
-  unsigned long elapsed_micros = current_micros - advanced_timing.cal_base_micros;
+  // Apply oscillator calibration - use 64-bit arithmetic throughout
+  uint64_t elapsed_micros = current_micros - advanced_timing.cal_base_micros;
   
-  // Handle potential wraparound in elapsed calculation
-  if (current_micros < advanced_timing.cal_base_micros) {
-    // Wraparound occurred
-    elapsed_micros = (4294967295UL - advanced_timing.cal_base_micros) + current_micros + 1;
-  }
-  
-  // Apply PPM correction
-  float corrected_elapsed = elapsed_micros * (1.0 + advanced_timing.oscillator_calibration_ppm / 1e6);
+  // No wraparound handling needed with 64-bit arithmetic
+  // Apply PPM correction using 64-bit math
+  double corrected_elapsed = (double)elapsed_micros * (1.0 + advanced_timing.oscillator_calibration_ppm / 1e6);
   
   return advanced_timing.cal_base_micros + (uint64_t)corrected_elapsed;
 }
@@ -882,6 +985,21 @@ void outputDataWithOverflowProtection(uint16_t seq, uint64_t timestamp, int timi
   if (checkSerialBufferOverflow()) {
     // Skip this sample to prevent buffer overflow
     serial_monitor.samples_skipped_due_to_overflow++;
+    
+    // Send OFLOW meta message periodically to signal backpressure
+    uint32_t current_time = millis();
+    if (current_time - serial_monitor.last_oflow_message_time >= serial_monitor.oflow_report_interval_ms) {
+      Serial1.print("OFLOW:");
+      Serial1.print(serial_monitor.samples_skipped_due_to_overflow);
+      Serial1.print(",");
+      Serial1.print(serial_monitor.buffer_overflows);
+      Serial1.print(",");
+      Serial1.print(Serial1.availableForWrite());
+      Serial1.println();
+      
+      serial_monitor.oflow_message_count++;
+      serial_monitor.last_oflow_message_time = current_time;
+    }
     return;
   }
   
@@ -980,6 +1098,9 @@ void generatePreciseSample() {
   if (advanced_timing.sample_index >= advanced_timing.reference_update_interval) {
     updateTimingReference();
   }
+  
+  // Verify ADC throughput margin before sampling
+  verifyADCThroughput();
   
   // Ensure we are not early relative to the fractional scheduler
   long long wait = (long long)advanced_timing.next_sample_micros - (long long)current_virtual_micros;
@@ -1087,6 +1208,7 @@ void processLine(String line) {
             
             sequence = 0;
             streaming = true;
+            sendSessionHeader();
             
             Serial1.print("OK:Synchronized streaming prepared at ");
             Serial1.print(stream_rate);
@@ -1219,15 +1341,19 @@ void processLine(String line) {
     else if (command == "SET_PRECISE_INTERVAL") {
       unsigned long interval_us = params.toInt();
       if (interval_us >= 9900 && interval_us <= 10100) {
-        advanced_timing.sample_interval_us = interval_us;
         float new_rate = 1000000.0 / interval_us;
-        stream_rate = new_rate;
         
-        Serial1.print("OK:Precise interval set to ");
-        Serial1.print(interval_us);
-        Serial1.print("μs (");
-        Serial1.print(new_rate, 3);
+        // Check if rate change is allowed (bounded host nudges)
+        if (isRateChangeAllowed(new_rate)) {
+          advanced_timing.sample_interval_us = interval_us;
+          stream_rate = new_rate;
+          
+          Serial1.print("OK:Precise interval set to ");
+          Serial1.print(interval_us);
+          Serial1.print("μs (");
+          Serial1.print(new_rate, 3);
           Serial1.println("Hz)");
+        }
       } else {
         Serial1.println("ERROR:Invalid interval (9900-10100 μs)");
       }
@@ -1236,13 +1362,19 @@ void processLine(String line) {
       if (!streaming) {
         float rate = params.toFloat();
         if (rate > 0 && rate <= 1000) {
-          stream_rate = rate;
-          advanced_timing.sample_interval_us = (uint64_t)(1000000.0 / rate);
+          // Check if rate change is allowed (bounded host nudges)
+          if (isRateChangeAllowed(rate)) {
+            stream_rate = rate;
+            advanced_timing.sample_interval_us = (uint64_t)(1000000.0 / rate);
+          } else {
+            return;  // Rate change rejected
+          }
         }
         
         sequence = 0;
         establishSamplingTiming();
         streaming = true;
+        sendSessionHeader();
         
         Serial1.print("OK:Streaming started at ");
         Serial1.print(stream_rate);
@@ -1285,6 +1417,8 @@ void processLine(String line) {
       advanced_timing.sync_on_pps = false;
       advanced_timing.pps_countdown = 0;
       advanced_timing.waiting_for_sync_start = false;
+      // Reset session header flag for next stream
+      session_tracker.session_header_sent = false;
       Serial1.print("DEBUG:Generated ");
       Serial1.print(advanced_timing.samples_generated);
       Serial1.println(" samples");
@@ -1402,7 +1536,24 @@ void processLine(String line) {
       streaming = false;
       advanced_timing.timing_established = false;
       sequence = 0;
+      // Reset session header flag for next stream
+      session_tracker.session_header_sent = false;
       Serial1.println("OK:Device reset");
+    }
+    else if (command == "SET_CAL_PPM") {
+      float ppm_value = params.toFloat();
+      advanced_timing.oscillator_calibration_ppm = ppm_value;
+      advanced_timing.calibration_valid = true;
+      
+      // Apply hard limits and sanity checks
+      clampOscillatorCalibration();
+      
+      // Save calibration to EEPROM for future boots
+      saveOscillatorCalibration();
+      
+      Serial1.print("OK:Manual calibration set to ");
+      Serial1.print(advanced_timing.oscillator_calibration_ppm, 2);
+      Serial1.println(" ppm");
     }
     else {
       Serial1.println("ERROR:Unknown command");
@@ -1412,13 +1563,262 @@ void processLine(String line) {
   }
 }
 
+bool verifyADCThroughput() {
+  // Calculate required throughput: channels × oversample × stream_rate × 2 (for filter + MUX overhead)
+  uint32_t required_samples_per_sec = num_channels * max(1, current_dithering) * stream_rate * 2;
+  
+  // Get ADC rate in samples per second
+  uint32_t adc_rate_sps;
+  switch(current_adc_rate) {
+    case ADS126X_RATE_2_5: adc_rate_sps = 2; break;
+    case ADS126X_RATE_5: adc_rate_sps = 5; break;
+    case ADS126X_RATE_10: adc_rate_sps = 10; break;
+    case ADS126X_RATE_16_6: adc_rate_sps = 16; break;
+    case ADS126X_RATE_20: adc_rate_sps = 20; break;
+    case ADS126X_RATE_50: adc_rate_sps = 50; break;
+    case ADS126X_RATE_60: adc_rate_sps = 60; break;
+    case ADS126X_RATE_100: adc_rate_sps = 100; break;
+    case ADS126X_RATE_400: adc_rate_sps = 400; break;
+    case ADS126X_RATE_1200: adc_rate_sps = 1200; break;
+    case ADS126X_RATE_2400: adc_rate_sps = 2400; break;
+    case ADS126X_RATE_4800: adc_rate_sps = 4800; break;
+    case ADS126X_RATE_7200: adc_rate_sps = 7200; break;
+    case ADS126X_RATE_14400: adc_rate_sps = 14400; break;
+    case ADS126X_RATE_19200: adc_rate_sps = 19200; break;
+    case ADS126X_RATE_38400: adc_rate_sps = 38400; break;
+    default: adc_rate_sps = 19200; break;
+  }
+  
+  bool adequate = adc_rate_sps >= required_samples_per_sec;
+  
+  if (!adequate && !adc_monitor.throughput_warning_sent) {
+    Serial1.print("WARNING:ADC throughput inadequate - required: ");
+    Serial1.print(required_samples_per_sec);
+    Serial1.print(" sps, available: ");
+    Serial1.print(adc_rate_sps);
+    Serial1.println(" sps");
+    adc_monitor.throughput_warning_sent = true;
+  } else if (adequate && adc_monitor.throughput_warning_sent) {
+    adc_monitor.throughput_warning_sent = false;
+  }
+  
+  return adequate;
+}
+
 long readADC(int pos_pin, int neg_pin) {
   adc.setInputPins(pos_pin, neg_pin);
   
-  unsigned long startTime = micros();
+  uint32_t startTime = micros();
+  uint32_t timeout_us = 10000; // 10ms timeout
+  
+  // Wait for DRDY with timeout
   while(digitalRead(drdy_pin) == HIGH) {
-    if (micros() - startTime > 10000) return 0;
+    if (micros() - startTime > timeout_us) {
+      adc_monitor.deadline_misses++;
+      return 0;
+    }
+  }
+  
+  uint32_t conversion_time = micros() - startTime;
+  adc_monitor.total_conversions++;
+  
+  // Track conversion timing statistics
+  if (adc_monitor.total_conversions == 1) {
+    adc_monitor.min_conversion_time_us = conversion_time;
+    adc_monitor.max_conversion_time_us = conversion_time;
+  } else {
+    if (conversion_time > adc_monitor.max_conversion_time_us) {
+      adc_monitor.max_conversion_time_us = conversion_time;
+    }
+    if (conversion_time < adc_monitor.min_conversion_time_us) {
+      adc_monitor.min_conversion_time_us = conversion_time;
+    }
   }
   
   return adc.readADC1();
+}
+
+void sendSessionHeader() {
+  if (session_tracker.session_header_sent) {
+    return;  // Already sent for this session
+  }
+  
+  // Generate new stream_id for this session
+  session_tracker.stream_id = millis();
+  
+  // Send session header with metadata
+  Serial1.print("SESSION:");
+  Serial1.print(session_tracker.boot_id);
+  Serial1.print(",");
+  Serial1.print(session_tracker.stream_id);
+  Serial1.print(",");
+  Serial1.print(stream_rate);
+  Serial1.print(",");
+  Serial1.print(num_channels);
+  Serial1.print(",");
+  Serial1.print(current_adc_filter);
+  Serial1.print(",");
+  Serial1.print(current_adc_gain);
+  Serial1.print(",");
+  Serial1.print(current_dithering);
+  Serial1.print(",");
+  Serial1.print(getTimingSourceName(advanced_timing.current_source));
+  Serial1.print(",");
+  Serial1.print(advanced_timing.oscillator_calibration_ppm, 2);
+  Serial1.println();
+  
+  session_tracker.session_header_sent = true;
+}
+
+void clampOscillatorCalibration() {
+  // Hard limits and sanity checks: clamp oscillator_calibration_ppm to ±200 ppm
+  if (advanced_timing.oscillator_calibration_ppm > 200.0) {
+    Serial1.print("WARNING:Oscillator calibration clamped from ");
+    Serial1.print(advanced_timing.oscillator_calibration_ppm, 2);
+    Serial1.println(" ppm to 200 ppm");
+    advanced_timing.oscillator_calibration_ppm = 200.0;
+  } else if (advanced_timing.oscillator_calibration_ppm < -200.0) {
+    Serial1.print("WARNING:Oscillator calibration clamped from ");
+    Serial1.print(advanced_timing.oscillator_calibration_ppm, 2);
+    Serial1.println(" ppm to -200 ppm");
+    advanced_timing.oscillator_calibration_ppm = -200.0;
+  }
+}
+
+void sendHealthBeacon() {
+  unsigned long current_time = millis();
+  
+  // Check if it's time to send STAT line (1 Hz)
+  if (current_time - advanced_timing.last_stat_time >= advanced_timing.stat_interval_ms) {
+    unsigned long pps_age_ms = current_time - advanced_timing.last_pps_time;
+    
+    Serial1.print("STAT:");
+    Serial1.print(getTimingSourceName(advanced_timing.current_source));
+    Serial1.print(",");
+    Serial1.print(advanced_timing.timing_accuracy_us, 1);
+    Serial1.print(",");
+    Serial1.print(advanced_timing.oscillator_calibration_ppm, 2);
+    Serial1.print(",");
+    Serial1.print(advanced_timing.pps_valid ? 1 : 0);
+    Serial1.print(",");
+    Serial1.print(pps_age_ms);
+    Serial1.print(",");
+    Serial1.print(advanced_timing.micros_wraparound_count);
+    Serial1.print(",");
+    Serial1.print(serial_monitor.buffer_overflows);
+    Serial1.print(",");
+    Serial1.print(serial_monitor.samples_skipped_due_to_overflow);
+    Serial1.print(",");
+    Serial1.print(session_tracker.boot_id);
+    Serial1.print(",");
+    Serial1.print(session_tracker.stream_id);
+    Serial1.print(",");
+    Serial1.print(adc_monitor.deadline_misses);
+    Serial1.println();
+    
+    advanced_timing.last_stat_time = current_time;
+  }
+}
+
+bool isRateChangeAllowed(float new_rate) {
+  // Calculate rate change in ppm
+  float rate_change_ppm = abs((new_rate - stream_rate) / stream_rate) * 1e6;
+  
+  // Check if we're PPS-locked
+  bool pps_locked = (advanced_timing.current_source == AdvancedTiming::TIMING_PPS_ACTIVE);
+  
+  if (pps_locked && rate_change_ppm > 50) {
+    // Reject large rate changes while PPS-locked
+    Serial1.print("ERROR:Rate change too large while PPS locked (");
+    Serial1.print(rate_change_ppm, 1);
+    Serial1.println(" ppm > 50 ppm limit)");
+    return false;
+  }
+  
+  // Allow small changes (e.g., 0.1%) for intentional experiments
+  if (rate_change_ppm > 1000) {  // 0.1% = 1000 ppm
+    Serial1.print("WARNING:Large rate change detected (");
+    Serial1.print(rate_change_ppm, 1);
+    Serial1.println(" ppm)");
+  }
+  
+  return true;
+}
+
+// EEPROM addresses for calibration storage
+#define EEPROM_CAL_MAGIC_ADDR 0
+#define EEPROM_CAL_PPM_ADDR 4
+#define EEPROM_CAL_MAGIC 0x12345678
+
+void saveOscillatorCalibration() {
+  // Save oscillator calibration to EEPROM for boot without GPS
+  EEPROM.put(EEPROM_CAL_MAGIC_ADDR, EEPROM_CAL_MAGIC);
+  EEPROM.put(EEPROM_CAL_PPM_ADDR, advanced_timing.oscillator_calibration_ppm);
+  
+  Serial1.print("DEBUG:Saved oscillator calibration to EEPROM: ");
+  Serial1.print(advanced_timing.oscillator_calibration_ppm, 2);
+  Serial1.println(" ppm");
+}
+
+void loadOscillatorCalibration() {
+  // Load oscillator calibration from EEPROM on boot
+  uint32_t magic;
+  float stored_ppm;
+  
+  EEPROM.get(EEPROM_CAL_MAGIC_ADDR, magic);
+  EEPROM.get(EEPROM_CAL_PPM_ADDR, stored_ppm);
+  
+  if (magic == EEPROM_CAL_MAGIC && abs(stored_ppm) <= 200.0) {
+    advanced_timing.oscillator_calibration_ppm = stored_ppm;
+    advanced_timing.calibration_valid = true;
+    
+    Serial1.print("DEBUG:Loaded oscillator calibration from EEPROM: ");
+    Serial1.print(stored_ppm, 2);
+    Serial1.println(" ppm");
+  } else {
+    Serial1.println("DEBUG:No valid calibration found in EEPROM");
+  }
+}
+
+float readInternalTemperature() {
+  // Read internal temperature sensor (if available on the MCU)
+  // This is a placeholder - actual implementation depends on MCU type
+  // For SAMD21/SAMD51, you might use ADC to read internal temperature sensor
+  
+  // Placeholder: return a reasonable temperature
+  // In a real implementation, you would:
+  // 1. Enable internal temperature sensor
+  // 2. Read ADC value
+  // 3. Convert to temperature using MCU-specific formula
+  
+  return 25.0;  // Placeholder temperature
+}
+
+void updateTemperatureCompensation() {
+  // Update temperature compensation for holdover mode
+  if (!advanced_timing.temp_compensation_enabled) {
+    return;
+  }
+  
+  float new_temp = readInternalTemperature();
+  float temp_change = new_temp - advanced_timing.reference_temp_c;
+  
+  // Apply temperature compensation to oscillator calibration
+  float temp_correction = temp_change * advanced_timing.temp_coefficient_ppm_per_c;
+  
+  // Only apply if we're in CAL mode (holdover without PPS)
+  if (advanced_timing.current_source == AdvancedTiming::TIMING_INTERNAL_CAL) {
+    advanced_timing.oscillator_calibration_ppm += temp_correction;
+    
+    // Clamp the result
+    clampOscillatorCalibration();
+    
+    Serial1.print("DEBUG:Temperature compensation applied: ");
+    Serial1.print(temp_change, 1);
+    Serial1.print("°C, correction: ");
+    Serial1.print(temp_correction, 2);
+    Serial1.println(" ppm");
+  }
+  
+  advanced_timing.current_temp_c = new_temp;
 }
