@@ -1,0 +1,34 @@
+[Unit]
+Description=gVsense Seismic Data Acquisition Agent
+Documentation=https://github.com/your-repo/gvsense
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=gvsense
+Group=gvsense
+WorkingDirectory=/opt/gvsense
+ExecStart=/usr/bin/python3 /opt/gvsense/enhanced_host_acquisition.py --port /dev/gsense-XIAO-1234 --device-id XIAO-1234
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Environment
+Environment=PYTHONPATH=/opt/gvsense
+Environment=PYTHONUNBUFFERED=1
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/gvsense
+
+# Resource limits
+LimitNOFILE=1024
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

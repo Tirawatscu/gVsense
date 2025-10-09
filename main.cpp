@@ -2,7 +2,6 @@
 #include <math.h>
 #include <ADS126X.h>
 #include <SPI.h>
-#include <EEPROM.h>
 
 // Global variables
 ADS126X adc;
@@ -36,7 +35,11 @@ struct SessionTracker {
   uint32_t boot_id;      // Unique ID for this MCU boot cycle
   uint32_t stream_id;    // Unique ID for this streaming session
   bool session_header_sent;
+  bool boot_header_sent; // Whether BOOT header was sent
 } session_tracker;
+
+// Firmware version
+const char* FIRMWARE_VERSION = "1.8.3";
 
 // Serial buffer overflow protection with backpressure signaling
 struct SerialBufferMonitor {
@@ -82,11 +85,18 @@ struct AdvancedTiming {
     } current_source;
     
     // Calibration Data
-    float oscillator_calibration_ppm;   // PPM correction from PPS
+    enum CalibrationSource {
+        CAL_NONE = 0,           // No calibration applied
+        CAL_PPS_LIVE = 1,       // Calibration from active PPS measurements
+        CAL_PI_PUSHED = 2      // Calibration pushed from Pi
+    } calibration_source;
+    
+    float oscillator_calibration_ppm;   // PPM correction (from PPS or Pi)
     uint64_t cal_base_micros;          // MCU micros() when calibration established (64-bit)
     unsigned long cal_base_millis;      // millis() when calibration established
     uint32_t cal_sample_count;          // Samples since calibration
     bool calibration_valid;
+    unsigned long cal_applied_at_ms;    // When calibration was applied (for diagnostics)
     
     // Clock Reset Detection and Handling
     unsigned long last_micros;          // Last micros() reading for reset detection
@@ -186,10 +196,10 @@ void sendSessionHeader();
 void clampOscillatorCalibration();
 void sendHealthBeacon();
 bool isRateChangeAllowed(float new_rate);
-void saveOscillatorCalibration();
-void loadOscillatorCalibration();
 float readInternalTemperature();
 void updateTemperatureCompensation();
+void sendBootHeader();
+const char* getCalibrationSourceName(int source);
 
 void setup() {
   Serial1.begin(921600);  // INCREASED from 115200 to prevent buffer overflow (8x faster)
@@ -223,11 +233,9 @@ void setup() {
   session_tracker.boot_id = millis();  // Use boot time as boot_id
   session_tracker.stream_id = 0;
   session_tracker.session_header_sent = false;
+  session_tracker.boot_header_sent = false;
   
   setupAdvancedTiming();
-  
-  // Load stored oscillator calibration from EEPROM
-  loadOscillatorCalibration();
   
   // Initialize SPI and ADC
   SPI.begin();
@@ -257,8 +265,6 @@ void setup() {
 }
 
 void loop() {
-  unsigned long current_micros = micros();
-  
   // Update timing source status
   updateTimingSource();
   
@@ -267,6 +273,9 @@ void loop() {
   
   // Update temperature compensation (if enabled)
   updateTemperatureCompensation();
+  
+  // Send boot header once
+  sendBootHeader();
   
   // Process serial commands
   while (Serial1.available()) {
@@ -341,7 +350,7 @@ void loop() {
         // Jump over missed slots to prevent burst catch-up
         advanced_timing.next_sample_micros += (uint64_t)(missed_slots * (long long)advanced_timing.effective_interval_us);
         Serial1.print("DEBUG:Skipped ");
-        Serial1.print(missed_slots);
+        Serial1.print((unsigned long)missed_slots);
         Serial1.println(" missed slots");
       }
 
@@ -387,6 +396,8 @@ void setupAdvancedTiming() {
   advanced_timing.pps_miss_count = 0;
   advanced_timing.pps_count = 0;
   advanced_timing.calibration_valid = false;
+  advanced_timing.calibration_source = AdvancedTiming::CAL_NONE;
+  advanced_timing.cal_applied_at_ms = 0;
   
   // Initialize clock reset detection
   advanced_timing.last_micros = micros();
@@ -724,6 +735,8 @@ void processPPS() {
       if (advanced_timing.pps_count < 10) {
         // Initial calibration - use direct measurement
         advanced_timing.oscillator_calibration_ppm = -error_ppm;
+        advanced_timing.calibration_source = AdvancedTiming::CAL_PPS_LIVE;
+        advanced_timing.cal_applied_at_ms = millis();
       } else {
         // Smooth calibration updates (10% new, 90% old)
         advanced_timing.oscillator_calibration_ppm = 
@@ -732,8 +745,8 @@ void processPPS() {
         // Apply hard limits and sanity checks
         clampOscillatorCalibration();
         
-        // Save calibration to EEPROM for future boots
-        saveOscillatorCalibration();
+        // Mark as PPS live calibration
+        advanced_timing.calibration_source = AdvancedTiming::CAL_PPS_LIVE;
         
         // Learn temperature coefficient if we have enough PPS data
         if (advanced_timing.pps_count > 100 && advanced_timing.pps_count % 50 == 0) {
@@ -758,7 +771,7 @@ void processPPS() {
         Serial1.print("DEBUG:Oscillator cal: ");
         Serial1.print(advanced_timing.oscillator_calibration_ppm, 2);
         Serial1.print("ppm, interval: ");
-        Serial1.print(actual_interval);
+        Serial1.print((unsigned long)actual_interval);
         Serial1.println("μs");
       }
     } else {
@@ -934,8 +947,6 @@ void updateTimingReference() {
   
   // Calculate the new timing base (where we are now in the sampling grid)
   uint64_t samples_since_start = advanced_timing.sample_index;
-  uint64_t expected_current_time = advanced_timing.timing_base_virtual_micros + 
-                                   (samples_since_start * advanced_timing.sample_interval_us);
   
   // Update the timing base to current position
   advanced_timing.timing_base_micros = current_virtual_micros;
@@ -1542,18 +1553,46 @@ void processLine(String line) {
     }
     else if (command == "SET_CAL_PPM") {
       float ppm_value = params.toFloat();
+      
+      // Guardrail: ignore if PPS_ACTIVE and difference > 50 ppm
+      if (advanced_timing.current_source == AdvancedTiming::TIMING_PPS_ACTIVE) {
+        float current_ppm = advanced_timing.oscillator_calibration_ppm;
+        float ppm_diff = abs(ppm_value - current_ppm);
+        if (ppm_diff > 50.0) {
+          Serial1.print("ERROR:Rate change too large while PPS locked (");
+          Serial1.print(ppm_diff, 1);
+          Serial1.println(" ppm > 50 ppm limit)");
+          return;
+        }
+      }
+      
       advanced_timing.oscillator_calibration_ppm = ppm_value;
       advanced_timing.calibration_valid = true;
+      advanced_timing.calibration_source = AdvancedTiming::CAL_PI_PUSHED;
+      advanced_timing.cal_applied_at_ms = millis();
       
       // Apply hard limits and sanity checks
       clampOscillatorCalibration();
       
-      // Save calibration to EEPROM for future boots
-      saveOscillatorCalibration();
-      
-      Serial1.print("OK:Manual calibration set to ");
+      Serial1.print("OK:Pi calibration set to ");
       Serial1.print(advanced_timing.oscillator_calibration_ppm, 2);
       Serial1.println(" ppm");
+    }
+    else if (command == "CLEAR_CAL") {
+      advanced_timing.calibration_valid = false;
+      advanced_timing.calibration_source = AdvancedTiming::CAL_NONE;
+      advanced_timing.oscillator_calibration_ppm = 0.0;
+      advanced_timing.cal_applied_at_ms = 0;
+      Serial1.println("OK:Calibration cleared");
+    }
+    else if (command == "GET_CAL") {
+      Serial1.print("CAL:");
+      Serial1.print(advanced_timing.calibration_valid ? 1 : 0);
+      Serial1.print(",");
+      Serial1.print(advanced_timing.oscillator_calibration_ppm, 2);
+      Serial1.print(",");
+      Serial1.print(getCalibrationSourceName(advanced_timing.calibration_source));
+      Serial1.println();
     }
     else {
       Serial1.println("ERROR:Unknown command");
@@ -1703,6 +1742,10 @@ void sendHealthBeacon() {
     Serial1.print(",");
     Serial1.print(pps_age_ms);
     Serial1.print(",");
+    Serial1.print(advanced_timing.calibration_valid ? 1 : 0);
+    Serial1.print(",");
+    Serial1.print(getCalibrationSourceName(advanced_timing.calibration_source));
+    Serial1.print(",");
     Serial1.print(advanced_timing.micros_wraparound_count);
     Serial1.print(",");
     Serial1.print(serial_monitor.buffer_overflows);
@@ -1745,38 +1788,25 @@ bool isRateChangeAllowed(float new_rate) {
   return true;
 }
 
-// EEPROM addresses for calibration storage
-#define EEPROM_CAL_MAGIC_ADDR 0
-#define EEPROM_CAL_PPM_ADDR 4
-#define EEPROM_CAL_MAGIC 0x12345678
-
-void saveOscillatorCalibration() {
-  // Save oscillator calibration to EEPROM for boot without GPS
-  EEPROM.put(EEPROM_CAL_MAGIC_ADDR, EEPROM_CAL_MAGIC);
-  EEPROM.put(EEPROM_CAL_PPM_ADDR, advanced_timing.oscillator_calibration_ppm);
+void sendBootHeader() {
+  if (session_tracker.boot_header_sent) {
+    return;  // Already sent
+  }
   
-  Serial1.print("DEBUG:Saved oscillator calibration to EEPROM: ");
-  Serial1.print(advanced_timing.oscillator_calibration_ppm, 2);
-  Serial1.println(" ppm");
+  Serial1.print("BOOT:device=XIAO-1234,boot_id=");
+  Serial1.print(session_tracker.boot_id);
+  Serial1.print(",fw=");
+  Serial1.println(FIRMWARE_VERSION);
+  
+  session_tracker.boot_header_sent = true;
 }
 
-void loadOscillatorCalibration() {
-  // Load oscillator calibration from EEPROM on boot
-  uint32_t magic;
-  float stored_ppm;
-  
-  EEPROM.get(EEPROM_CAL_MAGIC_ADDR, magic);
-  EEPROM.get(EEPROM_CAL_PPM_ADDR, stored_ppm);
-  
-  if (magic == EEPROM_CAL_MAGIC && abs(stored_ppm) <= 200.0) {
-    advanced_timing.oscillator_calibration_ppm = stored_ppm;
-    advanced_timing.calibration_valid = true;
-    
-    Serial1.print("DEBUG:Loaded oscillator calibration from EEPROM: ");
-    Serial1.print(stored_ppm, 2);
-    Serial1.println(" ppm");
-  } else {
-    Serial1.println("DEBUG:No valid calibration found in EEPROM");
+const char* getCalibrationSourceName(int source) {
+  switch (source) {
+    case AdvancedTiming::CAL_NONE: return "NONE";
+    case AdvancedTiming::CAL_PPS_LIVE: return "PPS_LIVE";
+    case AdvancedTiming::CAL_PI_PUSHED: return "PI_PUSHED";
+    default: return "UNKNOWN";
   }
 }
 
