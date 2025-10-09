@@ -17,8 +17,8 @@ import subprocess
 from collections import deque
 import numpy as np
 
-# MODIFIED: Import the new host-managed timing acquisition class
-from host_timing_acquisition import HostTimingSeismicAcquisition
+# MODIFIED: Import the new integrated acquisition system
+from integrated_acquisition import HostTimingSeismicAcquisition
 from data_saver import DataSaver
 from adaptive_timing_controller import AdaptiveTimingController
 
