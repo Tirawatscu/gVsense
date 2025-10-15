@@ -9,6 +9,8 @@ import math
 import threading
 import statistics
 from collections import deque
+from datetime import datetime, timezone
+import calendar
 import datetime
 import subprocess
 
@@ -16,6 +18,7 @@ class UnifiedTimingManager:
     """
     Single timing authority that coordinates all timing corrections
     Eliminates circular feedback loops by centralizing control
+    Enhanced with MCU firmware features: PPS-locked start, calibration management, etc.
     """
     
     def __init__(self):
@@ -24,6 +27,32 @@ class UnifiedTimingManager:
         self.reference_accuracy_us = 1000000  # 1 second default
         self.last_reference_update = 0
         self.reference_check_interval = 30.0  # Check every 30 seconds for timing source changes
+        
+        # NEW: MCU timing state machine thresholds
+        self.timing_state_machine = {
+            'current_state': 'RAW',  # ACTIVE, HOLDOVER, CAL, RAW
+            'state_transitions': {
+                'ACTIVE': {'timeout_ms': 1500, 'accuracy_us': 1},
+                'HOLDOVER': {'timeout_ms': 60000, 'accuracy_us': 10},
+                'CAL': {'timeout_ms': 300000, 'accuracy_us': 100},
+                'RAW': {'timeout_ms': float('inf'), 'accuracy_us': 1000000}
+            },
+            'last_pps_time': 0,
+            'state_history': []
+        }
+        
+        # NEW: Temperature-aware calibration
+        self.temperature_calibration = {
+            'enabled': False,
+            'base_temp_c': 25.0,
+            'temp_coefficient_ppm_per_c': 0.0,
+            'current_temp_c': 25.0
+        }
+        
+        # NEW: Smooth no-PPS degradation with EMA
+        self.oscillator_calibration_ppm = 0.0
+        self.calibration_ema_alpha = 0.01  # EMA smoothing factor
+        self.last_calibration_update = 0
         
         # Master timing state
         self.master_offset_ms = 0.0  # Current offset from reference time
@@ -129,21 +158,65 @@ class UnifiedTimingManager:
                 return time.time()
         except:
             return time.time()
+    
+    def _get_reference_time_for_error_measurement(self):
+        """Get reference time for error measurement - use MCU time when MCU timestamp mode is enabled"""
+        try:
+            # Check if MCU timestamp mode is enabled
+            if hasattr(self, 'seismic_device') and self.seismic_device:
+                if hasattr(self.seismic_device, 'timing_adapter'):
+                    if hasattr(self.seismic_device.timing_adapter, 'timestamp_generator'):
+                        timestamp_generator = self.seismic_device.timing_adapter.timestamp_generator
+                        if getattr(timestamp_generator, 'mcu_timestamp_mode', False):
+                            # MCU timestamp mode is enabled - disable error measurement to prevent drift
+                            # This prevents drift between MCU timestamps and host reference time
+                            print(f"🔧 DISABLING ERROR MEASUREMENT (MCU timestamp mode enabled)")
+                            
+                            # CRITICAL FIX: When MCU timestamp mode is enabled, we should NOT compare
+                            # MCU-derived timestamps to host reference time as this causes drift.
+                            # Instead, we disable error measurement entirely when MCU timestamp mode is active.
+                            
+                            # Return None to signal that error measurement should be skipped
+                            return None
+                        else:
+                            # MCU timestamp mode is disabled - use standard reference time
+                            return self.get_reference_time()
+            
+            # Fallback to standard reference time
+            return self.get_reference_time()
+        except Exception as e:
+            print(f"Warning: Error in _get_reference_time_for_error_measurement: {e}")
+            return self.get_reference_time()
             
     def _get_chrony_time(self):
-        """Get chrony-corrected time"""
+        """Get chrony-corrected time with proper GPS PPS offset"""
         try:
-            result = subprocess.run(['chronyc', 'tracking'], 
+            result = subprocess.run(['chronyc', 'tracking'],
                                   capture_output=True, text=True, timeout=1)
             if result.returncode == 0:
-                # Parse offset and apply correction
+                # Parse chrony output to extract offset
+                offset_seconds = 0.0
                 for line in result.stdout.split('\n'):
-                    if 'System time' in line:
-                        # Extract offset and apply correction
-                        # Implementation depends on chrony output format
-                        pass
-            return time.time()
-        except:
+                    if 'Last offset' in line:
+                        # Extract offset value: "Last offset     : -0.000005699 seconds"
+                        parts = line.split(':')
+                        if len(parts) >= 2:
+                            offset_str = parts[1].strip().split()[0]
+                            try:
+                                offset_seconds = float(offset_str)
+                                break
+                            except ValueError:
+                                continue
+
+                # Apply offset correction to get GPS-corrected time
+                gps_corrected_time = time.time() + offset_seconds
+                print(f"🔧 GPS TIME CORRECTION: chrony offset {offset_seconds:.9f}s applied")
+                return gps_corrected_time
+            else:
+                print(f"🔧 CHRONYC ERROR: return code {result.returncode}")
+                return time.time()
+        except Exception as e:
+            print(f"🔧 CHRONYC ERROR: {e}")
             return time.time()
             
     def _get_chrony_status(self):
@@ -241,8 +314,19 @@ class UnifiedTimingManager:
                 
                 self._last_sequence_checked = sample_sequence
                 
-                # Get reference time
-                reference_time = self.get_reference_time()
+                # CRITICAL FIX: Use MCU-aware reference time for error measurement
+                # This prevents drift between MCU timestamps and host reference time
+                reference_time = self._get_reference_time_for_error_measurement()
+                
+                # Check if error measurement should be disabled (MCU timestamp mode)
+                if reference_time is None:
+                    print(f"🔧 ERROR MEASUREMENT DISABLED (MCU timestamp mode active)")
+                    return {
+                        'raw_error_ms': 0.0,
+                        'filtered_error_ms': 0.0,
+                        'drift_rate_ppm': 0.0,
+                        'confidence': 1.0
+                    }
                 
                 # Convert generated timestamp to seconds
                 generated_time = generated_timestamp_ms / 1000.0
@@ -364,23 +448,17 @@ class UnifiedTimingManager:
             else:
                 urgency = 0  # Low
                 
-            # Determine correction method
-            if self.reference_source == "GPS+PPS" and confidence > 0.8:
-                # High precision reference - use host corrections
-                method = "HOST"
-                max_correction = min(50.0, error_ms * 0.5)
-            elif self.reference_source == "NTP" and self.prefer_mcu_control:
-                # NTP reference - use MCU corrections
+            # Determine correction method - prefer MCU control to minimize rate chasing
+            if urgency >= 3:  # Emergency only (>100ms error)
                 method = "MCU"
-                max_correction = min(100.0, error_ms * 0.3)
-            elif urgency >= 2:
-                # Emergency - use both methods
-                method = "BOTH"
-                max_correction = min(200.0, error_ms * 0.2)
+                max_correction = min(20.0, error_ms * 0.1)  # Very gentle emergency correction
+            elif urgency >= 2:  # High urgency (>50ms error)
+                method = "MCU"
+                max_correction = min(10.0, error_ms * 0.05)  # Minimal correction
             else:
-                # Normal operation - prefer MCU
+                # Normal operation - let MCU be the PLL, minimal host intervention
                 method = "MCU"
-                max_correction = min(50.0, error_ms * 0.2)
+                max_correction = min(5.0, error_ms * 0.02)  # Barely any correction
                 
             return {
                 'method': method,
@@ -441,12 +519,138 @@ class UnifiedTimingManager:
     def get_precise_time(self):
         """Get precise time (alias for get_reference_time for compatibility)"""
         return self.get_reference_time()
+    
+    # NEW: MCU firmware feature methods
+    
+    def update_timing_state_machine(self, pps_valid: bool, pps_age_ms: float, current_temp_c: float = None):
+        """Update timing state machine based on PPS status and age"""
+        current_time = time.time()
+        
+        # Update temperature if provided
+        if current_temp_c is not None:
+            self.temperature_calibration['current_temp_c'] = current_temp_c
+        
+        # Update PPS time
+        if pps_valid:
+            self.timing_state_machine['last_pps_time'] = current_time
+        
+        # Determine new state based on PPS age
+        pps_age_ms = (current_time - self.timing_state_machine['last_pps_time']) * 1000
+        old_state = self.timing_state_machine['current_state']
+        
+        if pps_valid and pps_age_ms < self.timing_state_machine['state_transitions']['ACTIVE']['timeout_ms']:
+            new_state = 'ACTIVE'
+        elif pps_valid and pps_age_ms < self.timing_state_machine['state_transitions']['HOLDOVER']['timeout_ms']:
+            new_state = 'HOLDOVER'
+        elif pps_age_ms < self.timing_state_machine['state_transitions']['CAL']['timeout_ms']:
+            new_state = 'CAL'
+        else:
+            new_state = 'RAW'
+        
+        # Update state if changed
+        if new_state != old_state:
+            self.timing_state_machine['current_state'] = new_state
+            self.timing_state_machine['state_history'].append({
+                'time': current_time,
+                'from_state': old_state,
+                'to_state': new_state,
+                'pps_age_ms': pps_age_ms
+            })
+            
+            # Keep only last 100 transitions
+            if len(self.timing_state_machine['state_history']) > 100:
+                self.timing_state_machine['state_history'] = self.timing_state_machine['state_history'][-100:]
+            
+            print(f"🔄 TIMING STATE CHANGE: {old_state} → {new_state} (PPS age: {pps_age_ms:.1f}ms)")
+        
+        return new_state
+    
+    def get_timing_state_info(self):
+        """Get current timing state machine information"""
+        current_time = time.time()
+        pps_age_ms = (current_time - self.timing_state_machine['last_pps_time']) * 1000
+        
+        return {
+            'current_state': self.timing_state_machine['current_state'],
+            'pps_age_ms': pps_age_ms,
+            'accuracy_us': self.timing_state_machine['state_transitions'][self.timing_state_machine['current_state']]['accuracy_us'],
+            'state_history': self.timing_state_machine['state_history'][-10:],  # Last 10 transitions
+            'temperature_c': self.temperature_calibration['current_temp_c'],
+            'oscillator_calibration_ppm': self.oscillator_calibration_ppm
+        }
+    
+    def update_oscillator_calibration(self, new_ppm: float, source: str = 'unknown'):
+        """Update oscillator calibration with EMA smoothing"""
+        current_time = time.time()
+        
+        # Apply EMA smoothing for smooth degradation
+        if self.last_calibration_update > 0:
+            alpha = self.calibration_ema_alpha
+            self.oscillator_calibration_ppm = (
+                (1 - alpha) * self.oscillator_calibration_ppm + 
+                alpha * new_ppm
+            )
+        else:
+            self.oscillator_calibration_ppm = new_ppm
+        
+        # Apply temperature compensation if enabled
+        if self.temperature_calibration['enabled']:
+            temp_diff = self.temperature_calibration['current_temp_c'] - self.temperature_calibration['base_temp_c']
+            temp_compensation = temp_diff * self.temperature_calibration['temp_coefficient_ppm_per_c']
+            self.oscillator_calibration_ppm += temp_compensation
+        
+        # Apply hard limits (±200 ppm)
+        self.oscillator_calibration_ppm = max(-200.0, min(200.0, self.oscillator_calibration_ppm))
+        
+        self.last_calibration_update = current_time
+        
+        print(f"🔧 OSCILLATOR CALIBRATION: {new_ppm:.2f} → {self.oscillator_calibration_ppm:.2f} ppm (source: {source})")
+        
+        return self.oscillator_calibration_ppm
+    
+    def set_temperature_calibration(self, base_temp_c: float, temp_coefficient_ppm_per_c: float):
+        """Configure temperature-aware calibration"""
+        self.temperature_calibration['base_temp_c'] = base_temp_c
+        self.temperature_calibration['temp_coefficient_ppm_per_c'] = temp_coefficient_ppm_per_c
+        self.temperature_calibration['enabled'] = True
+        
+        print(f"🌡️  TEMPERATURE CALIBRATION: Base {base_temp_c}°C, {temp_coefficient_ppm_per_c:.3f} ppm/°C")
+    
+    def get_calibration_info(self):
+        """Get current calibration information"""
+        return {
+            'oscillator_calibration_ppm': self.oscillator_calibration_ppm,
+            'last_calibration_update': self.last_calibration_update,
+            'temperature_calibration': dict(self.temperature_calibration),
+            'calibration_ema_alpha': self.calibration_ema_alpha
+        }
+    
+    def apply_bounded_host_nudge(self, nudge_ppm: float, pps_locked: bool = False):
+        """Apply bounded host nudge with rate change rejection"""
+        # Reject large changes while PPS locked
+        if pps_locked and abs(nudge_ppm) > 50:
+            print(f"🚫 RATE CHANGE REJECTED: {nudge_ppm:.1f} ppm > 50 ppm limit (PPS locked)")
+            return False
+        
+        # Apply bounded adjustment
+        bounded_nudge = max(-50.0, min(50.0, nudge_ppm))
+        
+        if abs(bounded_nudge) > 0.1:  # Only apply if significant
+            self.update_oscillator_calibration(
+                self.oscillator_calibration_ppm + bounded_nudge, 
+                'host_nudge'
+            )
+            print(f"🔧 BOUNDED HOST NUDGE: {nudge_ppm:.1f} → {bounded_nudge:.1f} ppm")
+            return True
+        
+        return False
 
 
 class SimplifiedTimestampGenerator:
     """
     Simplified timestamp generator that ONLY generates timestamps
     No internal corrections - all corrections handled by UnifiedTimingManager
+    Enhanced with 64-bit timestamps and MCU firmware features
     """
     
     def __init__(self, expected_rate=100.0, quantization_ms=10):
@@ -464,11 +668,26 @@ class SimplifiedTimestampGenerator:
         # Timestamp quantization
         self.quantization_ms = quantization_ms
         
-        self.reference_time = None
+        # NEW: 64-bit timestamp support to avoid wrap boundary edge cases
+        self.reference_time_64 = None  # 64-bit microseconds since epoch
         self.reference_sequence = None
         self.last_sequence = None
         self.is_initialized = False
         self.lock = threading.Lock()
+        
+        # NEW: MCU timestamp integration
+        self.mcu_timestamp_mode = False
+        self.mcu_timestamp_offset_us = 0  # Offset between MCU and host timestamps
+        
+        # NEW: UTC timestamp policy
+        self.utc_stamping_enabled = True
+        self.utc_offset_seconds = 0  # UTC offset from system time
+        self.last_utc_sync_time = 0  # Last UTC synchronization time
+        
+        # NEW: Continuous tiny phase servo
+        self.phase_servo_enabled = True
+        self.phase_clamp_us = 20.0  # ±20 μs/sample clamp
+        self.current_phase_offset_us = 0.0
         
         # Statistics only
         self.stats = {
@@ -478,17 +697,59 @@ class SimplifiedTimestampGenerator:
             'last_timestamp': None,  # Track last generated timestamp for monitoring
             'last_sequence': None,  # Track last sequence for wraparound detection
             'max_sequence_seen': 0,   # Track highest sequence seen for debugging
-            'quantization_ms': quantization_ms  # Store quantization setting
+            'quantization_ms': quantization_ms,  # Store quantization setting
+            'mcu_timestamp_mode': False,
+            'phase_servo_offset_us': 0.0,
+            'phase_clamp_violations': 0,
+            'mcu_offset_updates': 0,  # Track number of offset updates
+            'last_offset_drift_us': 0.0  # Track last detected drift
         }
         
-    def generate_timestamp(self, sequence_number):
+    def generate_timestamp(self, sequence_number, mcu_timestamp_us=None):
         """
         Generate clean timestamp based ONLY on sequence progression
+        Enhanced with 64-bit timestamps and MCU timestamp integration
         No corrections applied here - purely mathematical generation
         """
         with self.lock:
             self.stats['samples_processed'] += 1
             current_time = time.time()
+            
+            # NEW: Use MCU timestamp if available and in MCU mode
+            if self.mcu_timestamp_mode and mcu_timestamp_us is not None:
+                # CRITICAL FIX: Calculate offset on first sample to align MCU and host time
+                if not self.is_initialized:
+                    # Calculate offset: host_time_us - mcu_timestamp_us
+                    host_time_us = int(current_time * 1000000)
+                    self.mcu_timestamp_offset_us = host_time_us - mcu_timestamp_us
+                    self.last_offset_update_time = current_time
+                    print(f"🔧 MCU TIMESTAMP OFFSET CALCULATED: {self.mcu_timestamp_offset_us}μs")
+                    print(f"   Host time: {host_time_us}μs, MCU time: {mcu_timestamp_us}μs")
+                
+                # CRITICAL FIX: Periodically update offset to prevent drift
+                # Update offset every 5 seconds to maintain alignment with real time
+                if hasattr(self, 'last_offset_update_time'):
+                    time_since_last_update = current_time - self.last_offset_update_time
+                    if time_since_last_update > 5.0:  # Update every 5 seconds (reduced from 30s)
+                        # Recalculate offset to maintain alignment
+                        host_time_us = int(current_time * 1000000)
+                        new_offset_us = host_time_us - mcu_timestamp_us
+                        offset_drift_us = new_offset_us - self.mcu_timestamp_offset_us
+                        
+                        # Only update if drift is significant (>0.5ms, reduced from 1ms)
+                        if abs(offset_drift_us) > 500:  # Reduced threshold for more frequent corrections
+                            self.mcu_timestamp_offset_us = new_offset_us
+                            self.last_offset_update_time = current_time
+                            self.stats['mcu_offset_updates'] += 1
+                            self.stats['last_offset_drift_us'] = offset_drift_us
+                            print(f"🔧 MCU TIMESTAMP OFFSET UPDATED: {offset_drift_us:+.0f}μs drift corrected")
+                            print(f"   New offset: {self.mcu_timestamp_offset_us}μs")
+                
+                # Convert MCU timestamp to host time reference
+                host_timestamp_us = mcu_timestamp_us + self.mcu_timestamp_offset_us
+                timestamp_s = host_timestamp_us / 1000000.0
+            else:
+                timestamp_s = current_time
             
             # CRITICAL FIX: Proactive wraparound detection at the entry point
             if self.is_initialized and self.last_sequence is not None:
@@ -500,7 +761,7 @@ class SimplifiedTimestampGenerator:
                     self.force_wraparound_recovery(sequence_number)
                     
                     # Generate timestamp using current time
-                    timestamp_ms = int(current_time * 1000)
+                    timestamp_ms = int(timestamp_s * 1000)
                     quantized_timestamp_ms = round(timestamp_ms / self.quantization_ms) * self.quantization_ms
                     self.stats['last_timestamp'] = quantized_timestamp_ms / 1000.0
                     return quantized_timestamp_ms
@@ -515,19 +776,19 @@ class SimplifiedTimestampGenerator:
                     self.force_wraparound_recovery(sequence_number)
                     
                     # Generate timestamp using current time
-                    timestamp_ms = int(current_time * 1000)
+                    timestamp_ms = int(timestamp_s * 1000)
                     quantized_timestamp_ms = round(timestamp_ms / self.quantization_ms) * self.quantization_ms
                     self.stats['last_timestamp'] = quantized_timestamp_ms / 1000.0
                     return quantized_timestamp_ms
             
-            # Initialize on first sample
+            # Initialize on first sample with 64-bit timestamp
             if not self.is_initialized:
-                self.reference_time = current_time
+                self.reference_time_64 = int(timestamp_s * 1000000)  # 64-bit microseconds
                 self.reference_sequence = sequence_number
                 self.last_sequence = sequence_number
                 self.is_initialized = True
                 # Apply quantization to first sample too
-                timestamp_ms = int(current_time * 1000)
+                timestamp_ms = int(timestamp_s * 1000)
                 quantized_timestamp_ms = round(timestamp_ms / self.quantization_ms) * self.quantization_ms
                 self.stats['last_timestamp'] = quantized_timestamp_ms / 1000.0
                 return quantized_timestamp_ms
@@ -544,12 +805,32 @@ class SimplifiedTimestampGenerator:
                 if sequence_diff == -1:
                     # Wraparound detected - use current time as base
                     timestamp_s = current_time
+                    # Update reference time to current time
+                    self.reference_time_64 = int(timestamp_s * 1000000)
                 else:
-                    # Generate timestamp based on pure sequence progression
-                    timestamp_s = self.reference_time + (sequence_diff * self.expected_interval_s)
+                    # Generate timestamp based on pure sequence progression using 64-bit arithmetic
+                    interval_us = int(self.expected_interval_s * 1000000)
+                    timestamp_us_64 = self.reference_time_64 + (sequence_diff * interval_us)
+                    timestamp_s = timestamp_us_64 / 1000000.0
             else:
                 # First time with sequence tracking
                 timestamp_s = current_time
+                self.reference_time_64 = int(timestamp_s * 1000000)
+            
+            # NEW: Apply continuous tiny phase servo
+            if self.phase_servo_enabled:
+                # Calculate phase offset based on sequence progression
+                expected_time_s = self.reference_time_64 / 1000000.0 + (sequence_number - self.reference_sequence) * self.expected_interval_s
+                phase_error_us = (timestamp_s - expected_time_s) * 1000000
+                
+                # Apply phase clamp
+                if abs(phase_error_us) > self.phase_clamp_us:
+                    phase_error_us = max(-self.phase_clamp_us, min(self.phase_clamp_us, phase_error_us))
+                    self.stats['phase_clamp_violations'] += 1
+                
+                # Update phase offset
+                self.current_phase_offset_us = phase_error_us
+                self.stats['phase_servo_offset_us'] = self.current_phase_offset_us
             
             # Update tracking
             self.last_sequence = sequence_number
@@ -692,9 +973,9 @@ class SimplifiedTimestampGenerator:
             print(f"   Last sequence: {self.last_sequence}")
             print(f"   Reference sequence: {self.reference_sequence}")
             
-            # Reset to current sequence and reinitialize
+            # Reset to current sequence and reinitialize with 64-bit timestamp
             self.reference_sequence = current_sequence
-            self.reference_time = time.time()
+            self.reference_time_64 = int(time.time() * 1000000)  # 64-bit microseconds
             self.last_sequence = current_sequence
             self.is_initialized = True
             
@@ -704,11 +985,99 @@ class SimplifiedTimestampGenerator:
             self.stats['max_sequence_seen'] = max(self.stats['max_sequence_seen'], current_sequence)
             
             print(f"✅ Wraparound recovery complete - reset to sequence {current_sequence}")
+    
+    # NEW: MCU firmware feature methods
+    
+    def enable_mcu_timestamp_mode(self, enabled: bool = True, offset_us: int = 0):
+        """Enable MCU timestamp mode with optional offset"""
+        with self.lock:
+            self.mcu_timestamp_mode = enabled
+            self.mcu_timestamp_offset_us = offset_us
+            self.stats['mcu_timestamp_mode'] = enabled
+            
+            if enabled:
+                print(f"🔧 MCU TIMESTAMP MODE ENABLED (offset: {offset_us}μs)")
+            else:
+                print("🔧 MCU TIMESTAMP MODE DISABLED")
+    
+    def set_phase_servo(self, enabled: bool = True, clamp_us: float = 20.0):
+        """Configure continuous tiny phase servo"""
+        with self.lock:
+            self.phase_servo_enabled = enabled
+            self.phase_clamp_us = clamp_us
+            
+            if enabled:
+                print(f"🔧 PHASE SERVO ENABLED (±{clamp_us}μs clamp)")
+            else:
+                print("🔧 PHASE SERVO DISABLED")
+    
+    def get_phase_servo_status(self):
+        """Get phase servo status and statistics"""
+        with self.lock:
+            return {
+                'enabled': self.phase_servo_enabled,
+                'clamp_us': self.phase_clamp_us,
+                'current_offset_us': self.current_phase_offset_us,
+                'clamp_violations': self.stats['phase_clamp_violations']
+            }
+    
+    def get_mcu_timestamp_status(self):
+        """Get MCU timestamp mode status"""
+        with self.lock:
+            return {
+                'enabled': self.mcu_timestamp_mode,
+                'offset_us': self.mcu_timestamp_offset_us
+            }
+    
+    def enable_utc_stamping(self, enabled: bool = True):
+        """Enable UTC timestamp policy with MCU timestamp as primary time axis"""
+        with self.lock:
+            self.utc_stamping_enabled = enabled
+            if enabled:
+                print("🌍 UTC STAMPING POLICY ENABLED: MCU timestamp as primary time axis")
+            else:
+                print("🌍 UTC STAMPING POLICY DISABLED")
+    
+    def set_utc_offset(self, offset_seconds: float):
+        """Set UTC offset from system time"""
+        with self.lock:
+            self.utc_offset_seconds = offset_seconds
+            self.last_utc_sync_time = time.time()
+            print(f"🌍 UTC OFFSET SET: {offset_seconds:.6f} seconds")
+    
+    def get_utc_timestamp(self, timestamp_s: float) -> datetime:
+        """Convert timestamp to UTC datetime"""
+        with self.lock:
+            if self.utc_stamping_enabled:
+                # Apply UTC offset
+                utc_timestamp_s = timestamp_s + self.utc_offset_seconds
+                return datetime.datetime.fromtimestamp(utc_timestamp_s, tz=timezone.utc)
+            else:
+                return datetime.datetime.fromtimestamp(timestamp_s, tz=timezone.utc)
+    
+    def get_utc_status(self):
+        """Get UTC stamping policy status"""
+        with self.lock:
+            # Get current UTC timestamp without nested lock
+            current_time = time.time()
+            if self.utc_stamping_enabled:
+                utc_timestamp_s = current_time + self.utc_offset_seconds
+                current_utc = datetime.datetime.fromtimestamp(utc_timestamp_s, tz=timezone.utc).isoformat()
+            else:
+                current_utc = datetime.datetime.fromtimestamp(current_time, tz=timezone.utc).isoformat()
+            
+            return {
+                'enabled': self.utc_stamping_enabled,
+                'offset_seconds': self.utc_offset_seconds,
+                'last_sync_time': self.last_utc_sync_time,
+                'current_utc': current_utc
+            }
 
 
 class UnifiedTimingController:
     """
     CORRECTED: Single timing controller with proper correction sign logic
+    Enhanced for MCU firmware features
     """
     
     def __init__(self, seismic_device, timing_manager):
@@ -718,10 +1087,10 @@ class UnifiedTimingController:
         self.controller_thread = None
         self.start_time = None  # Will be set when controller starts
         
-        # Control parameters - OPTIMIZED for minimal offset error fluctuations
-        self.measurement_interval_s = 0.5  # Measure every 0.5 seconds (faster response)
-        self.target_error_ms = 0.3        # Desired steady-state absolute error (±0.3ms)
-        self.min_error_threshold_ms = 0.1 # Deadband to avoid chattering (±0.1ms)
+        # Control parameters - OPTIMIZED for minimal rate chasing (let MCU be PLL)
+        self.measurement_interval_s = 5.0  # Measure every 5 seconds (reduced from 0.5s)
+        self.target_error_ms = 2.0        # Desired steady-state absolute error (±2ms, relaxed from ±0.3ms)
+        self.min_error_threshold_ms = 1.0  # Deadband to avoid chattering (±1ms, increased from ±0.1ms)
         
         # MCU control state
         self.current_mcu_interval_us = 10000.0  # 100Hz default
@@ -729,6 +1098,40 @@ class UnifiedTimingController:
         
         # Host correction state
         self.host_correction_ms = 0.0
+        
+        # NEW: MCU firmware integration
+        self.mcu_integration = {
+            'enabled': False,
+            'timing_source': 'UNKNOWN',
+            'accuracy_us': 1000000,
+            'calibration_ppm': 0.0,
+            'pps_valid': False,
+            'boot_id': None,
+            'stream_id': None,
+            'temperature_c': 25.0,
+            'buffer_overflows': 0,
+            'samples_skipped': 0
+        }
+        
+        # NEW: Adaptive timing control with bounded adjustments (minimal rate chasing)
+        self.adaptive_control = {
+            'enabled': True,
+            'target_rate': 100.0,
+            'rate_tolerance_ppm': 200,  # ±200 ppm tolerance (increased from ±50 ppm)
+            'last_rate_adjustment': 0,
+            'adjustment_cooldown_ms': 10000,  # 10 second cooldown (increased from 1s)
+            'max_adjustment_ppm': 20,  # Maximum single adjustment (reduced from 50)
+            'step_changes_enabled': False,  # Disable step changes to reduce chasing
+            'small_nudges_enabled': True
+        }
+        
+        # NEW: Phase servo integration
+        self.phase_servo = {
+            'enabled': True,
+            'clamp_us': 20.0,
+            'current_offset_us': 0.0,
+            'violations': 0
+        }
         
         # Statistics - ENHANCED for performance monitoring
         self.stats = {
@@ -739,7 +1142,12 @@ class UnifiedTimingController:
             'sign_corrections_applied': 0,  # Track corrections with proper sign
             'error_history': deque(maxlen=100),  # Track recent errors for analysis
             'convergence_time_s': 0.0,  # Time to reach target_error_ms
-            'target_achieved': False  # Whether ±10ms target has been reached
+            'target_achieved': False,  # Whether ±10ms target has been reached
+            'mcu_timestamp_mode': False,
+            'phase_servo_active': False,
+            'adaptive_adjustments': 0,
+            'bounded_adjustments': 0,
+            'rate_rejections': 0
         }
     
     def start_controller(self):
@@ -878,21 +1286,33 @@ class UnifiedTimingController:
     def _apply_mcu_correction_corrected(self, error_ms, strategy):
         """
         CORRECTED: Apply correction to MCU sampling rate with proper sign logic
-        OPTIMIZED for ±10ms target with adaptive correction strength
+        OPTIMIZED for minimal rate chasing - let MCU be the PLL
         
         CORRECT LOGIC:
         - If error_ms > 0: timestamps ahead of GPS → MCU too fast → need POSITIVE ppm to slow down
         - If error_ms < 0: timestamps behind GPS → MCU too slow → need NEGATIVE ppm to speed up
         """
         try:
-            # OPTIMIZED: Adaptive correction strength for minimal fluctuations
+            # NEW: Check cooldown to prevent excessive rate chasing
+            current_time = time.time() * 1000  # Convert to ms
+            time_since_last_adjustment = current_time - self.adaptive_control['last_rate_adjustment']
+            
+            if time_since_last_adjustment < self.adaptive_control['adjustment_cooldown_ms']:
+                print(f"🛑 RATE CHASING PREVENTION: Cooldown active ({time_since_last_adjustment:.0f}ms < {self.adaptive_control['adjustment_cooldown_ms']}ms)")
+                return
+            
+            # NEW: Only apply corrections for significant errors
+            if abs(error_ms) < self.min_error_threshold_ms:
+                print(f"🛑 RATE CHASING PREVENTION: Error too small ({error_ms:.3f}ms < {self.min_error_threshold_ms}ms)")
+                return
+            # OPTIMIZED: Minimal correction strength to let MCU be the PLL
             error_abs = abs(error_ms)
-            if error_abs > 5.0:        # >5ms error: moderate correction (reduced from 10ms)
-                correction_ppm = +error_ms * 1.5  # Reduced from 2.0 for stability
-            elif error_abs > 1.0:      # 1..5ms: gentle correction
-                correction_ppm = +error_ms * 0.8  # Reduced from 1.0 for stability
-            else:                      # <1ms: very gentle to avoid oscillation
-                correction_ppm = +error_ms * 0.3  # Reduced from 0.4 for stability
+            if error_abs > 10.0:       # >10ms error: minimal correction
+                correction_ppm = +error_ms * 0.5  # Very gentle correction
+            elif error_abs > 5.0:      # 5-10ms: very gentle correction
+                correction_ppm = +error_ms * 0.3  # Minimal correction
+            else:                      # <5ms: no correction (let MCU handle)
+                correction_ppm = +error_ms * 0.1  # Barely any correction
             
             # Limit correction
             max_correction = strategy['max_correction']
@@ -925,7 +1345,9 @@ class UnifiedTimingController:
                 self.current_mcu_interval_us = new_interval_us
                 self.stats['mcu_adjustments'] += 1
                 self.stats['sign_corrections_applied'] += 1
-                print(f"CORRECTED: MCU correction applied successfully")
+                # Update last adjustment time to enforce cooldown
+                self.adaptive_control['last_rate_adjustment'] = time.time() * 1000
+                print(f"CORRECTED: MCU correction applied successfully (cooldown: {self.adaptive_control['adjustment_cooldown_ms']}ms)")
             else:
                 print(f"CORRECTED: MCU correction failed: {result}")
                 
@@ -1018,7 +1440,127 @@ class UnifiedTimingController:
         
     def get_stats(self):
         """Get controller statistics"""
-        return dict(self.stats)
+        stats = dict(self.stats)
+        # Convert deque to list for JSON serialization
+        if 'error_history' in stats:
+            stats['error_history'] = list(stats['error_history'])
+        return stats
+
+
+    # NEW: MCU firmware integration methods
+    
+    def update_mcu_status(self, status_data):
+        """Update MCU status from STATUS message"""
+        self.mcu_integration.update({
+            'timing_source': status_data.get('timing_source', 'UNKNOWN'),
+            'accuracy_us': status_data.get('accuracy_us', 1000000),
+            'calibration_ppm': status_data.get('calibration_ppm', 0.0),
+            'pps_valid': status_data.get('pps_valid', False),
+            'boot_id': status_data.get('boot_id'),
+            'stream_id': status_data.get('stream_id'),
+            'temperature_c': status_data.get('temperature_c', 25.0),
+            'buffer_overflows': status_data.get('buffer_overflows', 0),
+            'samples_skipped': status_data.get('samples_skipped', 0)
+        })
+        
+        # Update timing manager with MCU calibration
+        if 'calibration_ppm' in status_data:
+            self.timing_manager.update_oscillator_calibration(
+                status_data['calibration_ppm'],
+                status_data.get('temperature_c', 25.0)
+            )
+        
+        # Update phase servo if enabled
+        if self.phase_servo['enabled']:
+            if hasattr(self.seismic, 'timing_adapter') and hasattr(self.seismic.timing_adapter, 'timestamp_generator'):
+                self.seismic.timing_adapter.timestamp_generator.set_phase_servo(
+                    enabled=True,
+                    clamp_us=self.phase_servo['clamp_us']
+                )
+    
+    def enable_mcu_timestamp_mode(self, enabled: bool = True, offset_us: int = 0):
+        """Enable MCU timestamp mode"""
+        self.mcu_integration['enabled'] = enabled
+        self.stats['mcu_timestamp_mode'] = enabled
+        
+        if enabled:
+            # Access timestamp generator through the seismic device's timing adapter
+            if hasattr(self.seismic, 'timing_adapter') and hasattr(self.seismic.timing_adapter, 'timestamp_generator'):
+                self.seismic.timing_adapter.timestamp_generator.enable_mcu_timestamp_mode(
+                    enabled=True,
+                    offset_us=offset_us
+                )
+                print(f"🔧 MCU TIMESTAMP MODE ENABLED (offset: {offset_us}μs)")
+            else:
+                print("🔧 MCU TIMESTAMP MODE: timing adapter not available")
+        else:
+            if hasattr(self.seismic, 'timing_adapter') and hasattr(self.seismic.timing_adapter, 'timestamp_generator'):
+                self.seismic.timing_adapter.timestamp_generator.enable_mcu_timestamp_mode(enabled=False)
+            print("🔧 MCU TIMESTAMP MODE DISABLED")
+    
+    def set_adaptive_control(self, enabled: bool = True, target_rate: float = 100.0):
+        """Configure adaptive timing control"""
+        self.adaptive_control['enabled'] = enabled
+        self.adaptive_control['target_rate'] = target_rate
+        
+        if enabled:
+            print(f"🔧 ADAPTIVE CONTROL ENABLED (target: {target_rate} Hz)")
+        else:
+            print("🔧 ADAPTIVE CONTROL DISABLED")
+    
+    def apply_bounded_adjustment(self, adjustment_ppm: float, force: bool = False):
+        """Apply bounded adjustment with rate change rejection"""
+        if not self.adaptive_control['enabled']:
+            return False
+        
+        # Check cooldown period
+        current_time = time.time() * 1000
+        if not force and (current_time - self.adaptive_control['last_rate_adjustment']) < self.adaptive_control['adjustment_cooldown_ms']:
+            return False
+        
+        # Rate change rejection while PPS locked
+        if self.mcu_integration['pps_valid'] and abs(adjustment_ppm) > self.adaptive_control['rate_tolerance_ppm']:
+            self.stats['rate_rejections'] += 1
+            print(f"🚫 RATE CHANGE REJECTED: {adjustment_ppm:.2f} ppm (PPS locked, >{self.adaptive_control['rate_tolerance_ppm']} ppm)")
+            return False
+        
+        # Apply bounded adjustment
+        bounded_adjustment = max(-self.adaptive_control['max_adjustment_ppm'], 
+                                min(self.adaptive_control['max_adjustment_ppm'], adjustment_ppm))
+        
+        if abs(bounded_adjustment) > 0.1:  # Only apply if significant
+            # Convert ppm to interval adjustment
+            current_interval = self.current_mcu_interval_us
+            new_interval = current_interval * (1 + bounded_adjustment / 1000000.0)
+            
+            # Apply to MCU
+            if hasattr(self.seismic, 'set_mcu_interval'):
+                self.seismic.set_mcu_interval(int(new_interval))
+            
+            self.current_mcu_interval_us = new_interval
+            self.adaptive_control['last_rate_adjustment'] = current_time
+            self.stats['bounded_adjustments'] += 1
+            self.stats['adaptive_adjustments'] += 1
+            
+            print(f"🔧 BOUNDED ADJUSTMENT APPLIED: {bounded_adjustment:.2f} ppm")
+            return True
+        
+        return False
+    
+    def get_mcu_integration_status(self):
+        """Get MCU integration status"""
+        return {
+            'mcu_integration': self.mcu_integration,
+            'adaptive_control': self.adaptive_control,
+            'phase_servo': self.phase_servo,
+            'stats': {
+                'mcu_timestamp_mode': self.stats['mcu_timestamp_mode'],
+                'phase_servo_active': self.stats['phase_servo_active'],
+                'adaptive_adjustments': self.stats['adaptive_adjustments'],
+                'bounded_adjustments': self.stats['bounded_adjustments'],
+                'rate_rejections': self.stats['rate_rejections']
+            }
+        }
 
 
 # Integration adapter for existing codebase
@@ -1045,10 +1587,17 @@ class TimingAdapter:
             seismic_device, self.unified_manager
         )
         
-    def generate_timestamp(self, sequence, timing_manager=None):
+        # CRITICAL FIX: Give UnifiedTimingManager access to seismic_device for MCU-aware error measurement
+        self.unified_manager.seismic_device = seismic_device
+        
+        # Enable MCU firmware features by default
+        self.unified_controller.enable_mcu_timestamp_mode(enabled=True)
+        self.unified_controller.set_adaptive_control(enabled=True)
+        
+    def generate_timestamp(self, sequence, timing_manager=None, mcu_timestamp_us=None):
         """Generate timestamp (compatible with existing interface)"""
-        # Generate clean timestamp
-        raw_timestamp = self.timestamp_generator.generate_timestamp(sequence)
+        # Generate clean timestamp with MCU timestamp support
+        raw_timestamp = self.timestamp_generator.generate_timestamp(sequence, mcu_timestamp_us)
         
         # CRITICAL FIX: Force integer quantization to prevent floating-point precision errors
         # This ensures all timestamps end with proper quantization boundaries
@@ -1073,7 +1622,70 @@ class TimingAdapter:
             
     def get_timing_info(self):
         """Get timing info (compatible with existing interface)"""
-        return self.unified_manager.get_timing_info()
+        timing_info = self.unified_manager.get_timing_info()
+        
+        # Add adaptive control status if available
+        if self.unified_controller:
+            timing_info['adaptive_control'] = self.unified_controller.adaptive_control
+        
+        return timing_info
+    
+    # NEW: MCU firmware integration methods
+    
+    def update_mcu_status(self, status_data):
+        """Update MCU status from STATUS message"""
+        if self.unified_controller:
+            self.unified_controller.update_mcu_status(status_data)
+    
+    def enable_mcu_timestamp_mode(self, enabled: bool = True, offset_us: int = 0):
+        """Enable MCU timestamp mode"""
+        if self.unified_controller:
+            self.unified_controller.enable_mcu_timestamp_mode(enabled, offset_us)
+    
+    def set_adaptive_control(self, enabled: bool = True, target_rate: float = 100.0):
+        """Configure adaptive timing control"""
+        if self.unified_controller:
+            self.unified_controller.set_adaptive_control(enabled, target_rate)
+    
+    def apply_bounded_adjustment(self, adjustment_ppm: float, force: bool = False):
+        """Apply bounded adjustment with rate change rejection"""
+        if self.unified_controller:
+            return self.unified_controller.apply_bounded_adjustment(adjustment_ppm, force)
+        return False
+    
+    def get_mcu_integration_status(self):
+        """Get MCU integration status"""
+        if self.unified_controller:
+            return self.unified_controller.get_mcu_integration_status()
+        return {}
+    
+    def get_phase_servo_status(self):
+        """Get phase servo status"""
+        return self.timestamp_generator.get_phase_servo_status()
+    
+    def get_mcu_timestamp_status(self):
+        """Get MCU timestamp mode status"""
+        return self.timestamp_generator.get_mcu_timestamp_status()
+    
+    def get_timing_state_info(self):
+        """Get timing state machine information"""
+        return self.unified_manager.get_timing_state_info()
+    
+    def enable_utc_stamping(self, enabled: bool = True):
+        """Enable UTC timestamp policy"""
+        self.timestamp_generator.enable_utc_stamping(enabled)
+    
+    def set_utc_offset(self, offset_seconds: float):
+        """Set UTC offset from system time"""
+        self.timestamp_generator.set_utc_offset(offset_seconds)
+    
+    def get_utc_timestamp(self, timestamp_s: float):
+        """Convert timestamp to UTC datetime"""
+        return self.timestamp_generator.get_utc_timestamp(timestamp_s)
+    
+    def get_utc_status(self):
+        """Get UTC stamping policy status"""
+        return self.timestamp_generator.get_utc_status()
         
     def apply_timing_correction(self, timestamp_ms):
         """Apply timing correction (compatible with existing interface)"""

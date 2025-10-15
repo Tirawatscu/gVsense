@@ -1,0 +1,10 @@
+{
+  "XIAO-1234": {
+    "ppm": -19.0,
+    "source": "manual",
+    "notes": "Manual calibration based on MCU detected drift of +19ppm",
+    "timestamp": "2025-10-10T14:50:40.096444",
+    "device_id": "XIAO-1234",
+    "original_ppm": -19.0
+  }
+}

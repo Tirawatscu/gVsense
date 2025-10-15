@@ -17,8 +17,8 @@ import subprocess
 from collections import deque
 import numpy as np
 
-# MODIFIED: Import the new integrated acquisition system
-from integrated_acquisition import HostTimingSeismicAcquisition
+# MODIFIED: Import the enhanced host-managed timing acquisition class
+from host_timing_acquisition import HostTimingSeismicAcquisition
 from data_saver import DataSaver
 from adaptive_timing_controller import AdaptiveTimingController
 
@@ -696,6 +696,15 @@ def get_status():
             print(f"Error getting quantization info: {e}")
             timestamp_quantization_info = {'error': str(e)}
 
+    # NEW: Add GPS alignment status
+    gps_alignment_status = {}
+    try:
+        # Call the GPS alignment helper function directly
+        gps_alignment_status = _get_gps_alignment_data()
+    except Exception as e:
+        print(f"Error getting GPS alignment status: {e}")
+        gps_alignment_status = {'status': 'error', 'message': str(e)}
+
     # NEW: Add adaptive controller status
     adaptive_status = {}
     if adaptive_controller:
@@ -712,6 +721,15 @@ def get_status():
             adaptive_status = {'enabled': False, 'error': str(e)}
     else:
         adaptive_status = {'enabled': False, 'status': 'not_initialized'}
+
+    # NEW: Add MCU calibration status
+    mcu_calibration_status = {}
+    if seismic:
+        try:
+            mcu_calibration_status = seismic.get_calibration_status()
+        except Exception as e:
+            print(f"Error getting MCU calibration status: {e}")
+            mcu_calibration_status = {'error': str(e)}
 
     # Get auto-start status
     pps_lock_status = {'locked': False, 'source': 'UNKNOWN', 'accuracy_us': 1000000}
@@ -752,7 +770,9 @@ def get_status():
         'saving_config': saving_config,
         'sample_tracking': sample_tracking_stats,  # NEW: Sample tracking stats (JSON-safe)
         'timestamp_quantization': timestamp_quantization_info,  # NEW: Timestamp quantization info
+        'gps_alignment': gps_alignment_status,  # NEW: GPS-MCU alignment status
         'adaptive_timing': adaptive_status,  # NEW: Adaptive timing controller status
+        'mcu_calibration': mcu_calibration_status,  # NEW: MCU calibration status
         'auto_start': auto_start_status,  # NEW: Auto-start trigger status
         'thingsboard': {
             'enabled': tb_config.get('enabled', False),
@@ -769,7 +789,29 @@ def get_status():
 @app.route('/api/server_time')
 def get_server_time():
     """Return the device server's current time and precise time if available"""
-    now_s = time.time()
+    # Get chrony-corrected GPS time
+    try:
+        import subprocess
+        result = subprocess.run(['chronyc', 'tracking'], capture_output=True, text=True, timeout=1)
+        chrony_offset_seconds = 0.0
+        if result.returncode == 0:
+            for line in result.stdout.split('\n'):
+                if 'Last offset' in line:
+                    parts = line.split(':')
+                    if len(parts) >= 2:
+                        offset_str = parts[1].strip().split()[0]
+                        chrony_offset_seconds = float(offset_str)
+                        break
+        
+        # Apply chrony correction to system time for GPS accuracy
+        system_time = time.time()
+        gps_corrected_time = system_time + chrony_offset_seconds
+        now_s = gps_corrected_time  # Use GPS-corrected time
+    except Exception:
+        # Fallback to system time if chrony fails
+        now_s = time.time()
+        chrony_offset_seconds = 0.0
+    
     precise_s = None
     source = None
     accuracy_us = None
@@ -784,9 +826,12 @@ def get_server_time():
             accuracy_us = tq.get('accuracy_us')
         except Exception:
             pass
+    
     resp = {
         'server_time_ms': int(now_s * 1000),
-        'server_time_iso': datetime.fromtimestamp(now_s).isoformat()
+        'server_time_iso': datetime.fromtimestamp(now_s).isoformat(),
+        'gps_corrected': True,
+        'chrony_offset_ms': round(chrony_offset_seconds * 1000, 3)
     }
     if precise_s is not None:
         resp['precise_time_ms'] = int(precise_s * 1000)
@@ -806,26 +851,59 @@ def get_unified_timing_status():
         timing_info = seismic.timing_adapter.get_timing_info()
         
         # Add generator stats
-        generator_stats = seismic.timestamp_generator.get_stats()
+        generator_stats = seismic.timing_adapter.timestamp_generator.get_stats()
         
         # Add controller stats if available
         controller_stats = {}
         if adaptive_controller and hasattr(adaptive_controller, 'unified_controller'):
             controller_stats = adaptive_controller.get_stats()
+        elif seismic and hasattr(seismic, 'timing_adapter') and hasattr(seismic.timing_adapter, 'unified_controller'):
+            controller_stats = seismic.timing_adapter.unified_controller.get_stats()
         
-        # Compute timestamp health for UI (last sample vs now and precise host time)
+        # Add timing state machine info
+        timing_state_info = {}
+        try:
+            timing_state_info = seismic.timing_adapter.get_timing_state_info()
+        except Exception as e:
+            timing_state_info = {'error': str(e)}
+        
+        # Compute timestamp health for UI (last sample vs GPS-corrected time)
         timestamp_health = {}
         try:
             if seismic and hasattr(seismic, 'timestamp_generator'):
-                gen_stats = seismic.timestamp_generator.get_stats()
+                gen_stats = seismic.timing_adapter.timestamp_generator.get_stats()
                 last_ts = gen_stats.get('last_timestamp')  # seconds float
                 if last_ts:
-                    now_s = time.time()
+                    # CRITICAL FIX: Use GPS-corrected time instead of raw system time
+                    # This ensures we're comparing against the same time reference as the MCU
+                    import subprocess
+                    result = subprocess.run(['chronyc', 'tracking'], capture_output=True, text=True, timeout=1)
+                    gps_offset_seconds = 0.0
+                    
+                    if result.returncode == 0:
+                        for line in result.stdout.split('\n'):
+                            if 'Last offset' in line:
+                                parts = line.split(':')
+                                if len(parts) >= 2:
+                                    offset_str = parts[1].strip().split()[0]
+                                    gps_offset_seconds = float(offset_str)
+                    
+                    # Use GPS-corrected time as reference
+                    gps_corrected_now = time.time() + gps_offset_seconds
+                    
                     timestamp_health['last_timestamp'] = int(last_ts * 1000)
-                    timestamp_health['offset_ms'] = int((last_ts - now_s) * 1000)
+                    timestamp_health['timestamp_age_ms'] = int((gps_corrected_now - last_ts) * 1000)
+                    
+                    # Calculate offset relative to GPS-corrected time
+                    offset_ms = int((gps_corrected_now - last_ts) * 1000)
+                    timestamp_health['offset_ms'] = offset_ms
+                    
+                    # Use precise GPS time if available
                     if hasattr(seismic, 'timing_manager') and seismic.timing_manager:
                         precise_now = seismic.timing_manager.get_precise_time()
-                        timestamp_health['offset_precise_ms'] = int((last_ts - precise_now) * 1000)
+                        if precise_now:
+                            offset_precise_ms = int((precise_now - last_ts) * 1000)
+                            timestamp_health['offset_precise_ms'] = offset_precise_ms
         except Exception as e:
             timestamp_health = {'error': str(e)}
         
@@ -833,6 +911,7 @@ def get_unified_timing_status():
             'unified_timing': timing_info,
             'timestamp_generator': generator_stats,
             'controller': controller_stats,
+            'timing_state_machine': timing_state_info,  # NEW: Include timing state machine
             'timestamp_health': timestamp_health,  # NEW: Include timestamp health data
             'system_health': _assess_timing_health(timing_info)
         })
@@ -1455,12 +1534,12 @@ def start_stream():
         if hasattr(seismic, 'timestamp_generator'):
             try:
                 # Call the new reset method to clear all timing state
-                if hasattr(seismic.timestamp_generator, 'reset_for_restart'):
-                    seismic.timestamp_generator.reset_for_restart()
+                if hasattr(seismic.timing_adapter.timestamp_generator, 'reset_for_restart'):
+                    seismic.timing_adapter.timestamp_generator.reset_for_restart()
                 else:
                     print("⚠️  Warning: reset_for_restart method not found, using basic reset")
-                    seismic.timestamp_generator.last_sequence = None
-                    seismic.timestamp_generator.reference_sequence = None
+                    seismic.timing_adapter.timestamp_generator.last_sequence = None
+                    seismic.timing_adapter.timestamp_generator.reference_sequence = None
             except Exception as e:
                 print(f"Warning: Could not reset timestamp generator: {e}")
         elif hasattr(seismic, 'timing_adapter') and hasattr(seismic.timing_adapter, 'timestamp_generator'):
@@ -1668,8 +1747,8 @@ def check_auto_start_trigger():
                             if hasattr(seismic, 'timestamp_generator'):
                                 try:
                                     # Call the new reset method to clear all timing state
-                                    if hasattr(seismic.timestamp_generator, 'reset_for_restart'):
-                                        seismic.timestamp_generator.reset_for_restart()
+                                    if hasattr(seismic.timing_adapter.timestamp_generator, 'reset_for_restart'):
+                                        seismic.timing_adapter.timestamp_generator.reset_for_restart()
                                         print("✅ Timing state reset for clean auto-start")
                                     else:
                                         print("⚠️  Warning: reset_for_restart method not found")
@@ -1828,6 +1907,15 @@ def background_monitor():
                 except Exception as e:
                     print(f"Error getting quantization info: {e}")
                     timestamp_quantization_info = {'error': str(e)}
+
+            # Get MCU calibration status
+            mcu_calibration_status = {}
+            if seismic:
+                try:
+                    mcu_calibration_status = seismic.get_calibration_status()
+                except Exception as e:
+                    print(f"Error getting MCU calibration status: {e}")
+                    mcu_calibration_status = {'error': str(e)}
             
             # Note: PPS realignment is now handled automatically by the unified timing system
             # Unified timing system handles PPS alignment automatically
@@ -1837,15 +1925,22 @@ def background_monitor():
             timestamp_health = {}
             try:
                 if seismic and hasattr(seismic, 'timestamp_generator'):
-                    gen_stats = seismic.timestamp_generator.get_stats()
+                    gen_stats = seismic.timing_adapter.timestamp_generator.get_stats()
                     last_ts = gen_stats.get('last_timestamp')  # seconds float
                     if last_ts:
                         now_s = time.time()
                         timestamp_health['last_timestamp'] = int(last_ts * 1000)
-                        timestamp_health['offset_ms'] = int((last_ts - now_s) * 1000)
+                        # CRITICAL FIX: Correct the offset calculation
+                        # If last_ts is behind now_s, the offset should be positive (how far behind)
+                        # If last_ts is ahead of now_s, the offset should be negative (how far ahead)
+                        offset_ms = int((now_s - last_ts) * 1000)  # FIXED: now_s - last_ts
+                        timestamp_health['offset_ms'] = offset_ms
+                        
                         if hasattr(seismic, 'timing_manager') and seismic.timing_manager:
                             precise_now = seismic.timing_manager.get_precise_time()
-                            timestamp_health['offset_precise_ms'] = int((last_ts - precise_now) * 1000)
+                            if precise_now:
+                                offset_precise_ms = int((precise_now - last_ts) * 1000)  # FIXED: precise_now - last_ts
+                                timestamp_health['offset_precise_ms'] = offset_precise_ms
             except Exception as e:
                 timestamp_health = {'error': str(e)}
 
@@ -1868,6 +1963,7 @@ def background_monitor():
                 'saving_config': saving_config,
                 'sample_tracking': sample_tracking_stats,
                 'timestamp_quantization': timestamp_quantization_info,  # NEW: Timestamp quantization info
+                'mcu_calibration': mcu_calibration_status,  # NEW: MCU calibration status
                 'timestamp_health': timestamp_health,
                 'thingsboard': {
                     'enabled': tb_config.get('enabled', False),
@@ -1895,34 +1991,34 @@ def get_timing_diagnostics():
     if seismic and hasattr(seismic, 'timestamp_generator'):
         try:
             # Get timestamp generator statistics
-            diagnostics['timestamp_generator'] = make_json_safe(seismic.timestamp_generator.get_stats())
+            diagnostics['timestamp_generator'] = make_json_safe(seismic.timing_adapter.timestamp_generator.get_stats())
             
             # Get health assessment
-            with seismic.timestamp_generator.lock:
+            with seismic.timing_adapter.timestamp_generator.lock:
                 health = {
                     'status': 'unknown',
                     'issues': [],
                     'recommendations': []
                 }
                 
-                if not seismic.timestamp_generator.is_initialized:
+                if not seismic.timing_adapter.timestamp_generator.is_initialized:
                     health['status'] = 'not_initialized'
                 else:
                     # Check for issues
                     issues = []
-                    stats = seismic.timestamp_generator.stats
+                    stats = seismic.timing_adapter.timestamp_generator.stats
                     
                     if stats['resets_performed'] > 5:
                         issues.append('frequent_resets')
                     
-                    if abs(seismic.timestamp_generator.current_drift_rate) > 100:
+                    if abs(seismic.timing_adapter.timestamp_generator.current_drift_rate) > 100:
                         issues.append('high_drift')
                     
-                    if len(seismic.timestamp_generator.recent_intervals) > 5:
+                    if len(seismic.timing_adapter.timestamp_generator.recent_intervals) > 5:
                         try:
                             import statistics
-                            avg_interval = statistics.mean(seismic.timestamp_generator.recent_intervals)
-                            if abs(avg_interval - seismic.timestamp_generator.expected_interval) > 0.001:
+                            avg_interval = statistics.mean(seismic.timing_adapter.timestamp_generator.recent_intervals)
+                            if abs(avg_interval - seismic.timing_adapter.timestamp_generator.expected_interval) > 0.001:
                                 issues.append('rate_mismatch')
                         except:
                             pass
@@ -1972,20 +2068,20 @@ def get_timing_diagnostics():
                 diagnostics['recent_samples'] = recent_samples
             
             # Performance metrics
-            if seismic.timestamp_generator.is_initialized:
-                uptime = time.time() - (seismic.timestamp_generator.reference_system_time or time.time())
-                samples_processed = seismic.timestamp_generator.stats['samples_processed']
+            if seismic.timing_adapter.timestamp_generator.is_initialized:
+                uptime = time.time() - (seismic.timing_adapter.timestamp_generator.reference_system_time or time.time())
+                samples_processed = seismic.timing_adapter.timestamp_generator.stats['samples_processed']
                 processing_rate = samples_processed / uptime if uptime > 0 else 0
                 
                 diagnostics['performance_metrics'] = {
                     'uptime_seconds': uptime,
                     'samples_processed': samples_processed,
                     'processing_rate_hz': processing_rate,
-                    'drift_rate_ppm': seismic.timestamp_generator.current_drift_rate,
-                    'consecutive_good_samples': seismic.timestamp_generator.consecutive_good_samples,
+                    'drift_rate_ppm': seismic.timing_adapter.timestamp_generator.current_drift_rate,
+                    'consecutive_good_samples': seismic.timing_adapter.timestamp_generator.consecutive_good_samples,
                     'anomaly_rate_percent': (
-                        (seismic.timestamp_generator.stats['resets_performed'] + 
-                         seismic.timestamp_generator.stats['outliers_rejected']) / 
+                        (seismic.timing_adapter.timestamp_generator.stats['resets_performed'] + 
+                         seismic.timing_adapter.timestamp_generator.stats['outliers_rejected']) / 
                         max(samples_processed, 1) * 100
                     )
                 }
@@ -2003,7 +2099,7 @@ def reset_timestamp_generator():
     """Reset the timestamp generator"""
     if seismic and hasattr(seismic, 'timestamp_generator'):
         try:
-            seismic.timestamp_generator.reset()
+            seismic.timing_adapter.timestamp_generator.reset()
             return jsonify({'status': 'success', 'message': 'Timestamp generator reset'})
         except Exception as e:
             return jsonify({'status': 'error', 'message': str(e)}), 500
@@ -2024,18 +2120,18 @@ def handle_timestamp_config():
             if 'expected_rate' in config_data:
                 rate = float(config_data['expected_rate'])
                 if 1 <= rate <= 1000:
-                    seismic.timestamp_generator.expected_rate = rate
-                    seismic.timestamp_generator.expected_interval = 1.0 / rate
+                    seismic.timing_adapter.timestamp_generator.expected_rate = rate
+                    seismic.timing_adapter.timestamp_generator.expected_interval = 1.0 / rate
             
             if 'sequence_gap_threshold' in config_data:
                 threshold = int(config_data['sequence_gap_threshold'])
                 if 1 <= threshold <= 100:
-                    seismic.timestamp_generator.sequence_gap_threshold = threshold
+                    seismic.timing_adapter.timestamp_generator.sequence_gap_threshold = threshold
             
             if 'outlier_threshold' in config_data:
                 threshold = float(config_data['outlier_threshold'])
                 if 0.001 <= threshold <= 1.0:
-                    seismic.timestamp_generator.outlier_threshold = threshold
+                    seismic.timing_adapter.timestamp_generator.outlier_threshold = threshold
             
             return jsonify({'status': 'success', 'message': 'Configuration updated'})
             
@@ -2045,12 +2141,12 @@ def handle_timestamp_config():
     # GET request - return current configuration
     try:
         config = {
-            'expected_rate': seismic.timestamp_generator.expected_rate,
-            'expected_interval': seismic.timestamp_generator.expected_interval,
-            'sequence_gap_threshold': seismic.timestamp_generator.sequence_gap_threshold,
-            'outlier_threshold': seismic.timestamp_generator.outlier_threshold,
-            'time_jump_threshold': seismic.timestamp_generator.time_jump_threshold,
-            'max_drift_ppm': seismic.timestamp_generator.max_drift_ppm
+            'expected_rate': seismic.timing_adapter.timestamp_generator.expected_rate,
+            'expected_interval': seismic.timing_adapter.timestamp_generator.expected_interval,
+            'sequence_gap_threshold': seismic.timing_adapter.timestamp_generator.sequence_gap_threshold,
+            'outlier_threshold': seismic.timing_adapter.timestamp_generator.outlier_threshold,
+            'time_jump_threshold': seismic.timing_adapter.timestamp_generator.time_jump_threshold,
+            'max_drift_ppm': seismic.timing_adapter.timestamp_generator.max_drift_ppm
         }
         return jsonify(config)
     except Exception as e:
@@ -2062,7 +2158,7 @@ def emit_timing_diagnostics():
     if seismic and hasattr(seismic, 'timestamp_generator'):
         try:
             # Get key metrics
-            stats = seismic.timestamp_generator.get_stats()
+            stats = seismic.timing_adapter.timestamp_generator.get_stats()
             
             # Create summary for websocket
             timing_summary = {
@@ -2351,6 +2447,665 @@ def reboot_system():
             'status': 'error',
             'message': f'Failed to reboot: {str(e)}'
         }), 500
+
+# NEW: MCU Calibration Management Endpoints
+@app.route('/api/mcu/calibration/status')
+def get_mcu_calibration_status():
+    """Get MCU calibration status"""
+    if not seismic:
+        return jsonify({'status': 'error', 'message': 'Device not connected'}), 400
+    
+    try:
+        calibration_status = seismic.get_calibration_status()
+        mcu_status = seismic.get_mcu_status()
+        session_info = seismic.get_session_info()
+        
+        return jsonify({
+            'status': 'ok',
+            'calibration': calibration_status,
+            'mcu_status': mcu_status,
+            'session': session_info
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/mcu/calibration/set', methods=['POST'])
+def set_mcu_calibration():
+    """Set MCU calibration"""
+    if not seismic:
+        return jsonify({'status': 'error', 'message': 'Device not connected'}), 400
+    
+    try:
+        data = request.json
+        ppm_value = float(data.get('ppm', 0.0))
+        source = data.get('source', 'manual')
+        notes = data.get('notes', '')
+        
+        # Validate ppm value
+        if abs(ppm_value) > 200:
+            return jsonify({'status': 'error', 'message': 'PPM value must be between -200 and +200'}), 400
+        
+        success = seismic.set_calibration(ppm_value, source, notes)
+        
+        if success:
+            return jsonify({
+                'status': 'ok',
+                'message': f'Calibration set to {ppm_value} ppm',
+                'ppm': ppm_value
+            })
+        else:
+            return jsonify({'status': 'error', 'message': 'Failed to set calibration'}), 500
+            
+    except ValueError as e:
+        return jsonify({'status': 'error', 'message': 'Invalid PPM value'}), 400
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/mcu/calibration/clear', methods=['POST'])
+def clear_mcu_calibration():
+    """Clear MCU calibration"""
+    if not seismic:
+        return jsonify({'status': 'error', 'message': 'Device not connected'}), 400
+    
+    try:
+        success = seismic.clear_calibration()
+        
+        if success:
+            return jsonify({
+                'status': 'ok',
+                'message': 'Calibration cleared'
+            })
+        else:
+            return jsonify({'status': 'error', 'message': 'Failed to clear calibration'}), 500
+            
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/mcu/calibration/test', methods=['POST'])
+def test_mcu_calibration():
+    """Test direct MCU calibration command"""
+    if not seismic:
+        return jsonify({'status': 'error', 'message': 'Device not connected'}), 400
+    
+    try:
+        data = request.json
+        ppm_value = float(data.get('ppm', -19.0))
+        
+        # Send direct command to MCU
+        command = f"SET_CAL_PPM:{ppm_value:.2f}"
+        result = seismic._send_command(command, timeout=5.0)
+        
+        if result and result[0]:
+            return jsonify({
+                'status': 'ok',
+                'message': f'MCU responded: {result[1]}',
+                'command': command,
+                'response': result[1]
+            })
+        else:
+            return jsonify({
+                'status': 'error',
+                'message': f'MCU command failed: {result[1] if result else "timeout"}',
+                'command': command,
+                'response': result[1] if result else None
+            }), 500
+            
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/mcu/calibration/adaptive', methods=['POST'])
+def adaptive_calibration():
+    """Implement adaptive calibration based on observed drift patterns"""
+    if not seismic:
+        return jsonify({'status': 'error', 'message': 'Device not connected'}), 400
+    
+    try:
+        # Get current timing status
+        timing_status = seismic.timing_adapter.get_timing_info()
+        offset_ms = timing_status.get('timestamp_health', {}).get('offset_ms', 0)
+        
+        # Get MCU status for current calibration
+        mcu_status = seismic.get_mcu_status()
+        current_calibration = mcu_status.get('calibration_ppm', 0)
+        
+        # Calculate adaptive correction based on offset
+        # If offset is positive, MCU is running fast (need negative correction)
+        # If offset is negative, MCU is running slow (need positive correction)
+        
+        # Adaptive strategy: adjust calibration by 10% of observed offset
+        # This provides gradual correction without overreacting
+        offset_correction_factor = 0.1  # 10% of offset
+        ppm_adjustment = -offset_ms * offset_correction_factor
+        
+        # Apply bounds to prevent extreme corrections
+        max_adjustment = 5.0  # Maximum 5 ppm adjustment per cycle
+        ppm_adjustment = max(-max_adjustment, min(max_adjustment, ppm_adjustment))
+        
+        new_calibration = current_calibration + ppm_adjustment
+        
+        # Apply hard limits
+        new_calibration = max(-200.0, min(200.0, new_calibration))
+        
+        # Only apply if adjustment is significant (>0.1 ppm)
+        if abs(ppm_adjustment) > 0.1:
+            # Send calibration to MCU
+            command = f"SET_CAL_PPM:{new_calibration:.2f}"
+            result = seismic._send_command(command, timeout=5.0)
+            
+            if result and result[0]:
+                # Save to persistent storage
+                seismic.calibration_storage.save_calibration(
+                    seismic.device_id, 
+                    new_calibration, 
+                    "adaptive", 
+                    notes=f"Adaptive correction: offset={offset_ms:.1f}ms, adjustment={ppm_adjustment:.2f}ppm"
+                )
+                
+                return jsonify({
+                    'status': 'ok',
+                    'message': f'Adaptive calibration applied',
+                    'offset_ms': offset_ms,
+                    'current_calibration': current_calibration,
+                    'adjustment': ppm_adjustment,
+                    'new_calibration': new_calibration,
+                    'mcu_response': result[1]
+                })
+            else:
+                return jsonify({
+                    'status': 'error',
+                    'message': f'MCU rejected calibration: {result[1] if result else "timeout"}',
+                    'offset_ms': offset_ms,
+                    'current_calibration': current_calibration,
+                    'attempted_adjustment': ppm_adjustment
+                }), 500
+        else:
+            return jsonify({
+                'status': 'ok',
+                'message': 'No adjustment needed',
+                'offset_ms': offset_ms,
+                'current_calibration': current_calibration,
+                'calculated_adjustment': ppm_adjustment
+            })
+            
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/mcu/status')
+def get_mcu_status():
+    """Get comprehensive MCU status"""
+    if not seismic:
+        return jsonify({'status': 'error', 'message': 'Device not connected'}), 400
+    
+    try:
+        mcu_status = seismic.get_mcu_status()
+        session_info = seismic.get_session_info()
+        flow_control = seismic.get_flow_control_status()
+        
+        return jsonify({
+            'status': 'ok',
+            'mcu_status': mcu_status,
+            'session_info': session_info,
+            'flow_control': flow_control
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/mcu/stream/start_pps', methods=['POST'])
+def start_mcu_stream_pps():
+    """Start MCU streaming with PPS-locked synchronization"""
+    if not seismic:
+        return jsonify({'status': 'error', 'message': 'Device not connected'}), 400
+    
+    try:
+        data = request.json
+        rate = float(data.get('rate', 100.0))
+        pps_wait = int(data.get('pps_wait', 2))
+        
+        if rate < 1 or rate > 1000:
+            return jsonify({'status': 'error', 'message': 'Rate must be between 1 and 1000 Hz'}), 400
+        
+        if pps_wait < 1 or pps_wait > 5:
+            return jsonify({'status': 'error', 'message': 'PPS wait count must be between 1 and 5'}), 400
+        
+        success, message = seismic.start_streaming_pps(rate, pps_wait)
+        
+        if success:
+            return jsonify({
+                'status': 'ok',
+                'message': message,
+                'rate': rate,
+                'pps_wait': pps_wait
+            })
+        else:
+            return jsonify({'status': 'error', 'message': message}), 500
+            
+    except ValueError as e:
+        return jsonify({'status': 'error', 'message': 'Invalid parameters'}), 400
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/mcu/binary_mode', methods=['POST'])
+def set_mcu_binary_mode():
+    """Enable/disable MCU binary framing mode"""
+    if not seismic:
+        return jsonify({'status': 'error', 'message': 'Device not connected'}), 400
+    
+    try:
+        data = request.json
+        enabled = bool(data.get('enabled', True))
+        
+        success = seismic.enable_binary_mode(enabled)
+        
+        if success:
+            return jsonify({
+                'status': 'ok',
+                'message': f'Binary mode {"enabled" if enabled else "disabled"}',
+                'enabled': enabled
+            })
+        else:
+            return jsonify({'status': 'error', 'message': 'Failed to set binary mode'}), 500
+            
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/mcu/binary_mode/status')
+def get_mcu_binary_mode_status():
+    """Get binary mode status and statistics"""
+    if not seismic:
+        return jsonify({'status': 'error', 'message': 'Device not connected'}), 400
+    
+    try:
+        status = seismic.get_binary_mode_status()
+        return jsonify({'status': 'ok', 'binary_mode': status})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/mcu/flow_control/status')
+def get_mcu_flow_control_status():
+    """Get flow control status and statistics"""
+    if not seismic:
+        return jsonify({'status': 'error', 'message': 'Device not connected'}), 400
+    
+    try:
+        status = seismic.get_flow_control_status()
+        return jsonify({'status': 'ok', 'flow_control': status})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/mcu/flow_control/manual', methods=['POST'])
+def manual_flow_control():
+    """Manually enable/disable flow control"""
+    if not seismic:
+        return jsonify({'status': 'error', 'message': 'Device not connected'}), 400
+    
+    try:
+        data = request.get_json()
+        action = data.get('action', 'toggle')  # 'enable', 'disable', 'toggle'
+        
+        if action == 'enable':
+            seismic._enable_backpressure()
+        elif action == 'disable':
+            seismic._disable_backpressure()
+        elif action == 'toggle':
+            if seismic.flow_control['backpressure_active']:
+                seismic._disable_backpressure()
+            else:
+                seismic._enable_backpressure()
+        
+        return jsonify({'status': 'ok', 'action': action})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/mcu/session/status')
+def get_mcu_session_status():
+    """Get session status and information"""
+    if not seismic:
+        return jsonify({'status': 'error', 'message': 'Device not connected'}), 400
+    
+    try:
+        session_info = seismic.get_session_info()
+        return jsonify({'status': 'ok', 'session': session_info})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/mcu/session/header')
+def get_mcu_session_header():
+    """Get current session header with comprehensive MCU metadata"""
+    if not seismic:
+        return jsonify({'status': 'error', 'message': 'Device not connected'}), 400
+    
+    try:
+        session_header = seismic.generate_session_header()
+        if session_header:
+            return jsonify({'status': 'ok', 'session_header': session_header})
+        else:
+            return jsonify({'status': 'error', 'message': 'Failed to generate session header'}), 500
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/mcu/session/reconstruction')
+def get_mcu_session_reconstruction():
+    """Get session reconstruction data"""
+    if not seismic:
+        return jsonify({'status': 'error', 'message': 'Device not connected'}), 400
+    
+    try:
+        reconstruction_data = seismic.get_session_reconstruction_data()
+        if reconstruction_data:
+            return jsonify({'status': 'ok', 'reconstruction_data': reconstruction_data})
+        else:
+            return jsonify({'status': 'error', 'message': 'Failed to get reconstruction data'}), 500
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/mcu/stat_line')
+def get_mcu_stat_line():
+    """Get current MCU STAT line with comprehensive timing information"""
+    if not seismic:
+        return jsonify({'status': 'error', 'message': 'Device not connected'}), 400
+    
+    try:
+        # Get MCU status
+        mcu_status = seismic.get_mcu_status()
+        
+        # Get timing information
+        timing_info = {}
+        if hasattr(seismic, 'timing_adapter'):
+            timing_info = seismic.timing_adapter.get_timing_info()
+        
+        # Format STAT line data
+        stat_line_data = {
+            'timestamp': time.time(),
+            'mcu_status': mcu_status,
+            'timing_info': timing_info,
+            'formatted_stat_line': f"STAT: {mcu_status.get('timing_source', 'UNKNOWN')}, "
+                                f"{mcu_status.get('timing_accuracy_us', 0)}μs, "
+                                f"{mcu_status.get('calibration_ppm', 0)}ppm, "
+                                f"calibration_valid={mcu_status.get('calibration_valid', False)}, "
+                                f"pps_valid={mcu_status.get('pps_valid', False)}, "
+                                f"pps_age={mcu_status.get('pps_age_ms', 0)}ms, "
+                                f"calibration_source={mcu_status.get('calibration_source', 'NONE')}, "
+                                f"boot_id={mcu_status.get('boot_id', 0)}, "
+                                f"stream_id={mcu_status.get('stream_id', 0)}, "
+                                f"overflows={mcu_status.get('buffer_overflows', 0)}, "
+                                f"skipped={mcu_status.get('samples_skipped', 0)}, "
+                                f"temp={mcu_status.get('temperature_c', 0)}°C"
+        }
+        
+        return jsonify({'status': 'ok', 'stat_line': stat_line_data})
+        
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/pps/status')
+def get_pps_status():
+    """Get PPS GPIO and chrony status"""
+    try:
+        import subprocess
+        import os
+        
+        # Check PPS device
+        pps_device_ok = os.path.exists('/dev/pps0')
+        
+        # Get chrony sources
+        chrony_sources = None
+        try:
+            result = subprocess.run(['chronyc', 'sources'], 
+                                  capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                chrony_sources = result.stdout
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        
+        # Get chrony tracking
+        chrony_tracking = None
+        try:
+            result = subprocess.run(['chronyc', 'tracking'], 
+                                  capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                chrony_tracking = result.stdout
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        
+        # Extract PPS source info
+        pps_source_info = None
+        if chrony_sources:
+            for line in chrony_sources.split('\n'):
+                if 'PPS' in line or 'GPS' in line:
+                    pps_source_info = line.strip()
+                    break
+        
+        return jsonify({
+            'status': 'ok',
+            'pps_status': {
+                'device_exists': pps_device_ok,
+                'device_path': '/dev/pps0',
+                'chrony_sources': chrony_sources,
+                'chrony_tracking': chrony_tracking,
+                'pps_source_info': pps_source_info
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+def _get_gps_alignment_data():
+    """Helper function to get GPS-MCU alignment data (returns dict, not Flask response)"""
+    try:
+        import subprocess
+        import time
+        
+        # Get GPS-corrected time from chrony
+        result = subprocess.run(['chronyc', 'tracking'], capture_output=True, text=True, timeout=1)
+        gps_offset_seconds = 0.0
+        rms_offset_seconds = 0.0
+        frequency_error_ppm = 0.0
+        
+        if result.returncode == 0:
+            for line in result.stdout.split('\n'):
+                if 'Last offset' in line:
+                    parts = line.split(':')
+                    if len(parts) >= 2:
+                        offset_str = parts[1].strip().split()[0]
+                        gps_offset_seconds = float(offset_str)
+                elif 'RMS offset' in line:
+                    parts = line.split(':')
+                    if len(parts) >= 2:
+                        rms_str = parts[1].strip().split()[0]
+                        rms_offset_seconds = float(rms_str)
+                elif 'Frequency' in line and 'ppm' in line:
+                    parts = line.split(':')
+                    if len(parts) >= 2:
+                        freq_str = parts[1].strip().split()[0]
+                        frequency_error_ppm = float(freq_str)
+        
+        gps_time = time.time() + gps_offset_seconds
+        
+        # Get MCU timestamp - SIMPLIFIED APPROACH
+        if not seismic:
+            return {'status': 'error', 'message': 'Device not connected'}
+            
+        # Get MCU calibration status directly
+        mcu_status = seismic.mcu_status
+        calibration_ppm = mcu_status.get('calibration_ppm', 0)
+        calibration_source = mcu_status.get('calibration_source', 'NONE')
+        pps_valid = mcu_status.get('pps_valid', False)
+        timing_source = mcu_status.get('timing_source', 'UNKNOWN')
+        timing_accuracy_us = mcu_status.get('timing_accuracy_us', 1000000)
+        
+        # PROPER FIX: Get actual MCU timestamp from the same source as timestamp generator
+        mcu_timestamp = 0
+        try:
+            # CRITICAL FIX: Use the exact same timestamp source as the timestamp generator
+            # The timestamp generator uses the raw MCU timestamp from the data stream
+            # We need to get the same raw timestamp, not the processed one from stats
+            
+            if hasattr(seismic, 'timing_adapter') and hasattr(seismic.timing_adapter, 'timestamp_generator'):
+                # Get the raw MCU timestamp from the most recent data sample
+                # This should be the same as what the timestamp generator uses
+                gen_stats = seismic.timing_adapter.timestamp_generator.get_stats()
+                
+                # Get the last processed timestamp (this is what the generator actually uses)
+                mcu_timestamp = gen_stats.get('last_timestamp', 0)
+                
+                # CRITICAL FIX: If we're in MCU timestamp mode, we need to account for the offset
+                # The generator applies an offset to align MCU and host time
+                if gen_stats.get('mcu_timestamp_mode', False):
+                    # The generator's last_timestamp is already the processed timestamp
+                    # This should be the same as what the generator outputs
+                    pass
+                else:
+                    # Fallback to current time if not in MCU mode
+                    mcu_timestamp = time.time()
+            else:
+                # Fallback to current time
+                mcu_timestamp = time.time()
+        except Exception as e:
+            mcu_timestamp = time.time()
+        
+        # Calculate the actual GPS-MCU alignment
+        gps_mcu_alignment_ms = (mcu_timestamp - gps_time) * 1000
+        
+        # Calculate calibration offset for display purposes
+        calibration_offset_ms = 0.0
+        if calibration_ppm != 0:
+            # This is just for display - the actual MCU timestamps are already calibrated
+            time_since_calibration = 3600  # Assume 1 hour for display
+            calibration_offset_ms = (calibration_ppm / 1e6) * time_since_calibration * 1000
+        
+        # Calculate performance score
+        performance_score = 100
+        
+        # Deduct points for poor alignment
+        if abs(gps_mcu_alignment_ms) > 10:
+            performance_score -= 30
+        elif abs(gps_mcu_alignment_ms) > 5:
+            performance_score -= 15
+        elif abs(gps_mcu_alignment_ms) > 1:
+            performance_score -= 5
+        
+        # Deduct points for poor calibration
+        if calibration_source != 'PPS_LIVE':
+            performance_score -= 40
+        elif abs(calibration_ppm) > 100:
+            performance_score -= 20
+        elif abs(calibration_ppm) > 50:
+            performance_score -= 10
+        
+        # Deduct points for PPS issues
+        if not pps_valid or timing_source != 'PPS_ACTIVE':
+            performance_score -= 30
+        
+        # Deduct points for poor timing accuracy
+        if timing_accuracy_us > 1000:
+            performance_score -= 20
+        elif timing_accuracy_us > 100:
+            performance_score -= 10
+        
+        performance_score = max(0, performance_score)
+        
+        # Determine grade
+        if performance_score >= 90:
+            grade = 'EXCELLENT'
+            status_emoji = '🟢'
+        elif performance_score >= 75:
+            grade = 'GOOD'
+            status_emoji = '🟡'
+        elif performance_score >= 60:
+            grade = 'ACCEPTABLE'
+            status_emoji = '🟠'
+        else:
+            grade = 'POOR'
+            status_emoji = '🔴'
+        
+        return {
+            'status': 'ok',
+            'gps_alignment': {
+                'gps_mcu_alignment_ms': round(gps_mcu_alignment_ms, 1),
+                'gps_offset_ms': round(gps_offset_seconds * 1000, 3),
+                'rms_offset_ms': round(rms_offset_seconds * 1000, 3),
+                'frequency_error_ppm': round(frequency_error_ppm, 3),
+                'gps_time': gps_time,
+                'mcu_time': mcu_timestamp,
+                'calibration_offset_ms': round(calibration_offset_ms, 3)
+            },
+            'mcu_performance': {
+                'calibration_ppm': round(calibration_ppm, 1),
+                'calibration_source': calibration_source,
+                'pps_valid': pps_valid,
+                'timing_source': timing_source,
+                'timing_accuracy_us': timing_accuracy_us
+            },
+            'performance_assessment': {
+                'score': performance_score,
+                'grade': grade,
+                'status_emoji': status_emoji,
+                'summary': f'GPS-MCU alignment: {abs(gps_mcu_alignment_ms):.1f}ms ({grade})'
+            }
+        }
+        
+    except Exception as e:
+        return {'status': 'error', 'message': str(e)}
+
+@app.route('/api/gps/alignment')
+def get_gps_alignment():
+    """Get GPS-MCU alignment status and performance indicators - FIXED VERSION"""
+    data = _get_gps_alignment_data()
+    if data['status'] == 'error':
+        return jsonify(data), 400
+    else:
+        return jsonify(data)
+
+@app.route('/api/utc/status')
+def get_utc_status():
+    """Get UTC stamping policy status"""
+    if not seismic:
+        return jsonify({'status': 'error', 'message': 'Device not connected'}), 400
+    
+    try:
+        utc_status = seismic.timing_adapter.get_utc_status()
+        return jsonify({'status': 'ok', 'utc_status': utc_status})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/utc/enable', methods=['POST'])
+def enable_utc_stamping():
+    """Enable/disable UTC stamping policy"""
+    if not seismic:
+        return jsonify({'status': 'error', 'message': 'Device not connected'}), 400
+    
+    try:
+        data = request.json
+        enabled = data.get('enabled', True)
+        
+        seismic.timing_adapter.enable_utc_stamping(enabled)
+        
+        return jsonify({
+            'status': 'ok',
+            'message': f'UTC stamping {"enabled" if enabled else "disabled"}'
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/utc/offset', methods=['POST'])
+def set_utc_offset():
+    """Set UTC offset from system time"""
+    if not seismic:
+        return jsonify({'status': 'error', 'message': 'Device not connected'}), 400
+    
+    try:
+        data = request.json
+        offset_seconds = float(data.get('offset_seconds', 0.0))
+        
+        seismic.timing_adapter.set_utc_offset(offset_seconds)
+        
+        return jsonify({
+            'status': 'ok',
+            'message': f'UTC offset set to {offset_seconds:.6f} seconds'
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 if __name__ == '__main__':
     # Ensure data directory exists

@@ -1,11 +1,11 @@
-# gVsense udev rules for stable device naming
-# Place in /etc/udev/rules.d/99-gvsense.rules
+# gVsense device rules
+# Provides consistent device naming for gVsense MCU devices
 
-# Rule for XIAO SAMD21 devices
-SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", ATTRS{serial}=="*", SYMLINK+="gsense-%s{serial}"
+# XIAO SAMD21 devices (Arduino-based)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="239a", ATTRS{idProduct}=="8019", SYMLINK+="gsense-xiao", GROUP="gvsense", MODE="0664"
 
-# Rule for generic USB serial devices (fallback)
-SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", ENV{ID_SERIAL_SHORT}=="*", SYMLINK+="gsense-%E{ID_SERIAL_SHORT}"
+# Generic USB serial devices that might be gVsense
+SUBSYSTEM=="tty", ATTRS{interface}=="gVsense*", SYMLINK+="gsense-device", GROUP="gvsense", MODE="0664"
 
-# Set permissions
-SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", GROUP="gvsense", MODE="0664"
+# Fallback for any USB serial device with gVsense in description
+SUBSYSTEM=="tty", ENV{ID_SERIAL_SHORT}=="*gVsense*", SYMLINK+="gsense-fallback", GROUP="gvsense", MODE="0664"

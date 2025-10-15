@@ -15,9 +15,195 @@ import subprocess
 from collections import deque
 import statistics
 import math
+import struct
+import binascii
+import json
+import os
+import queue
+from typing import Optional, Dict, Any, Callable, Tuple
 
 # Import the unified timing system
 from timing_fix import UnifiedTimingManager, SimplifiedTimestampGenerator, TimingAdapter
+
+# Calibration storage for persistent calibration data
+class CalibrationStorage:
+    """Persistent calibration storage for MCU oscillator calibration"""
+    
+    def __init__(self, storage_file="calibration.json"):
+        self.storage_file = storage_file
+        self.calibrations = {}
+        self.logger = logging.getLogger(__name__)
+        self._load_calibrations()
+    
+    def _load_calibrations(self):
+        """Load calibrations from file"""
+        try:
+            if os.path.exists(self.storage_file):
+                with open(self.storage_file, 'r') as f:
+                    self.calibrations = json.load(f)
+        except Exception as e:
+            self.logger.warning(f"Failed to load calibrations: {e}")
+            self.calibrations = {}
+    
+    def _save_calibrations(self):
+        """Save calibrations to file"""
+        try:
+            with open(self.storage_file, 'w') as f:
+                json.dump(self.calibrations, f, indent=2)
+        except Exception as e:
+            self.logger.error(f"Failed to save calibrations: {e}")
+    
+    def save_calibration(self, device_id: str, ppm_value: float, source: str, notes: str = "") -> bool:
+        """Save calibration for a device with sanity checks"""
+        try:
+            # Apply hard limits and sanity checks (±200 ppm)
+            clamped_ppm = max(-200.0, min(200.0, ppm_value))
+            
+            if abs(clamped_ppm - ppm_value) > 0.1:
+                self.logger.warning(f"Calibration clamped: {ppm_value:.2f} → {clamped_ppm:.2f} ppm (limit: ±200 ppm)")
+                notes += f" [CLAMPED from {ppm_value:.2f} ppm]"
+            
+            # Sanity check for reasonable values
+            if abs(clamped_ppm) > 100:
+                self.logger.warning(f"Large calibration value: {clamped_ppm:.2f} ppm (source: {source})")
+            
+            self.calibrations[device_id] = {
+                'ppm': clamped_ppm,
+                'source': source,
+                'notes': notes,
+                'timestamp': datetime.datetime.now().isoformat(),
+                'device_id': device_id,
+                'original_ppm': ppm_value  # Store original for audit
+            }
+            self._save_calibrations()
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to save calibration: {e}")
+            return False
+    
+    def load_calibration(self, device_id: str) -> Optional[Dict[str, Any]]:
+        """Load calibration for a device"""
+        return self.calibrations.get(device_id)
+    
+    def clear_calibration(self, device_id: str) -> bool:
+        """Clear calibration for a device"""
+        try:
+            if device_id in self.calibrations:
+                del self.calibrations[device_id]
+                self._save_calibrations()
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to clear calibration: {e}")
+            return False
+
+# Binary frame support for enhanced MCU communication
+class BinaryFrameParser:
+    """Parser for binary frames with sync word, length, and CRC"""
+    
+    SYNC_WORD = b'\xAA\x55\xCC\x33'  # 4-byte sync word
+    FRAME_HEADER_SIZE = 8  # sync(4) + length(2) + crc(2)
+    
+    def __init__(self):
+        self.buffer = bytearray()
+        self.sync_found = False
+        self.frame_length = 0
+        self.crc_expected = 0
+        self.logger = logging.getLogger(__name__)
+        
+        # CRC verification statistics
+        self.stats = {
+            'frames_received': 0,
+            'frames_valid': 0,
+            'frames_invalid': 0,
+            'crc_errors': 0,
+            'sync_losses': 0
+        }
+        
+    def add_data(self, data: bytes) -> list:
+        """Add data to buffer and return complete frames"""
+        self.buffer.extend(data)
+        frames = []
+        
+        while len(self.buffer) >= self.FRAME_HEADER_SIZE:
+            if not self.sync_found:
+                # Look for sync word
+                sync_pos = self.buffer.find(self.SYNC_WORD)
+                if sync_pos == -1:
+                    # No sync word found, keep last 3 bytes
+                    if len(self.buffer) > 3:
+                        self.buffer = self.buffer[-3:]
+                    break
+                elif sync_pos > 0:
+                    # Remove data before sync word
+                    self.buffer = self.buffer[sync_pos:]
+                
+                if len(self.buffer) >= self.FRAME_HEADER_SIZE:
+                    # Parse frame header
+                    self.frame_length = struct.unpack('<H', self.buffer[4:6])[0]
+                    self.crc_expected = struct.unpack('<H', self.buffer[6:8])[0]
+                    self.sync_found = True
+            
+            if self.sync_found:
+                total_frame_size = self.FRAME_HEADER_SIZE + self.frame_length
+                if len(self.buffer) >= total_frame_size:
+                    # Extract complete frame
+                    frame_data = bytes(self.buffer[:total_frame_size])
+                    payload = frame_data[self.FRAME_HEADER_SIZE:]
+                    
+                    # Verify CRC
+                    self.stats['frames_received'] += 1
+                    if self._verify_crc(payload, self.crc_expected):
+                        frames.append(payload)
+                        self.stats['frames_valid'] += 1
+                    else:
+                        self.logger.warning("Binary frame CRC mismatch")
+                        self.stats['frames_invalid'] += 1
+                        self.stats['crc_errors'] += 1
+                    
+                    # Remove processed frame
+                    self.buffer = self.buffer[total_frame_size:]
+                    self.sync_found = False
+                else:
+                    break
+        
+        return frames
+    
+    def _verify_crc(self, data: bytes, expected_crc: int) -> bool:
+        """Verify CRC-16 of frame data"""
+        try:
+            # Use CRC-16-CCITT (polynomial 0x1021)
+            calculated_crc = binascii.crc_hqx(data, 0) & 0xFFFF
+            return calculated_crc == expected_crc
+        except Exception:
+            return False
+    
+    def create_frame(self, payload: bytes) -> bytes:
+        """Create a binary frame with sync word, length, and CRC"""
+        length = len(payload)
+        crc = binascii.crc_hqx(payload, 0) & 0xFFFF
+        
+        frame = bytearray()
+        frame.extend(self.SYNC_WORD)
+        frame.extend(struct.pack('<H', length))
+        frame.extend(struct.pack('<H', crc))
+        frame.extend(payload)
+        
+        return bytes(frame)
+    
+    def get_stats(self):
+        """Get parser statistics including CRC verification"""
+        return {
+            'buffer_size': len(self.buffer),
+            'sync_found': self.sync_found,
+            'frame_length': self.frame_length,
+            'crc_expected': self.crc_expected,
+            'frames_received': self.stats['frames_received'],
+            'frames_valid': self.stats['frames_valid'],
+            'frames_invalid': self.stats['frames_invalid'],
+            'crc_errors': self.stats['crc_errors'],
+            'sync_losses': self.stats['sync_losses'],
+            'crc_success_rate': (self.stats['frames_valid'] / max(1, self.stats['frames_received'])) * 100
+        }
 
 # Import the robust timestamp generator (deprecated - will be removed)
 class RobustTimestampGenerator:
@@ -735,9 +921,11 @@ class RobustTimestampGenerator:
 
 
 class HostTimingSeismicAcquisition:
-    def __init__(self, port=None, baudrate=115200):
+    def __init__(self, port=None, baudrate=115200, device_id="XIAO-1234"):
         self.port = port
         self.baudrate = baudrate
+        self.device_id = device_id
+        self.logger = logging.getLogger(__name__)
         self.ser = None
         self.connection_lock = threading.RLock()
         self.is_connected = False
@@ -804,6 +992,87 @@ class HostTimingSeismicAcquisition:
         
         # Dithering state
         self.current_dithering = 4  # Default to 4x oversampling
+        
+        # NEW: Enhanced MCU communication features
+        self.calibration_storage = CalibrationStorage()
+        self.binary_parser = BinaryFrameParser()
+        self.binary_mode_enabled = False
+        self.binary_frame_stats = {
+            'frames_received': 0,
+            'frames_valid': 0,
+            'frames_invalid': 0,
+            'crc_errors': 0,
+            'sync_losses': 0
+        }
+        
+        # MCU status tracking
+        self.mcu_status = {
+            'timing_source': 'UNKNOWN',
+            'timing_accuracy_us': 1000000,
+            'calibration_ppm': 0.0,
+            'calibration_valid': False,
+            'calibration_source': 'NONE',
+            'pps_valid': False,
+            'pps_age_ms': 0,
+            'boot_id': None,
+            'stream_id': None,
+            'firmware_version': None,
+            'buffer_overflows': 0,
+            'samples_skipped': 0,
+            'temperature_c': 0.0
+        }
+        
+        # Flow control and backpressure
+        self.flow_control = {
+            'enabled': True,
+            'buffer_threshold': 0.8,  # 80% buffer usage triggers backpressure
+            'backpressure_active': False,
+            'last_flow_control_time': 0,
+            'overflow_count': 0,
+            'overflow_threshold': 5,  # Trigger backpressure after 5 overflows
+            'backpressure_duration_ms': 1000,  # Backpressure duration
+            'last_overflow_time': 0,
+            'overflow_history': deque(maxlen=100),  # Track recent overflows
+            'backpressure_requests': 0,
+            'backpressure_responses': 0
+        }
+        
+        # Session tracking
+        self.session_info = {
+            'boot_id': None,
+            'stream_id': None,
+            'start_time': None,
+            'pps_locked_start': False,
+            'session_header_received': False,
+            'session_id': None,  # Unique session identifier
+            'session_start_timestamp': None,  # UTC timestamp of session start
+            'session_metadata': {},  # Additional session metadata
+            'session_log': [],  # Session event log
+            'last_session_id': None,  # Previous session for stitching
+            'session_gap_detected': False,
+            'session_reconstruction_enabled': True
+        }
+        
+        # Calibration management
+        self.calibration_push_enabled = True
+        self.last_calibration_update = 0
+        self.stable_pps_start_time = None
+        self.stable_pps_threshold_ms = 600000  # 10 minutes
+        
+        # Threading for enhanced features
+        self.calibration_thread = None
+        self.stop_calibration_thread = False
+        self.stat_thread = None
+        self.stop_stat_thread = False
+        
+        # Fast serial reader with large buffers and async parsing queue
+        self.serial_buffer_size = 65536  # 64KB buffer
+        self.serial_read_buffer = bytearray()
+        self.parsing_queue = queue.Queue(maxsize=1000)  # Async parsing queue
+        self.reader_thread = None
+        self.stop_reader_thread = False
+        self.parser_thread = None
+        self.stop_parser_thread = False
         
         # Connect initially
         self._connect()
@@ -910,28 +1179,183 @@ class HostTimingSeismicAcquisition:
                 return False
     
     def start_receiver(self):
-        """Start the receiver thread to process incoming data"""
+        """Start the fast serial reader and parser threads"""
         if self.running:
-            print("Receiver thread already running")
+            print("Receiver threads already running")
             return
             
-        print("Starting receiver thread...")
+        print("Starting fast serial reader and parser threads...")
         self.running = True
-        self.rx_thread = threading.Thread(target=self._receiver_thread, name="SeismicReceiver")
-        self.rx_thread.daemon = True
-        self.rx_thread.start()
-        print("Receiver thread started")
+        
+        # Start fast serial reader thread
+        self.stop_reader_thread = False
+        self.reader_thread = threading.Thread(target=self._fast_serial_reader, name="FastSerialReader")
+        self.reader_thread.daemon = True
+        self.reader_thread.start()
+        
+        # Start async parser thread
+        self.stop_parser_thread = False
+        self.parser_thread = threading.Thread(target=self._async_parser, name="AsyncParser")
+        self.parser_thread.daemon = True
+        self.parser_thread.start()
+        
+        # Start enhanced features
+        self.start_enhanced_features()
+        
+        print("Fast serial reader and parser threads started")
+        print("Enhanced features started: calibration monitoring and stat reporting")
         
     def stop_receiver(self):
-        """Stop the receiver thread"""
+        """Stop the fast serial reader and parser threads"""
         if self.running:
-            print("Stopping receiver thread...")
+            print("Stopping fast serial reader and parser threads...")
             self.running = False
-            if self.rx_thread:
-                self.rx_thread.join(timeout=3.0)
-                if self.rx_thread.is_alive():
-                    print("Warning: Receiver thread did not stop cleanly")
-            print("Receiver thread stopped")
+            
+            # Stop enhanced features first
+            self.stop_enhanced_features()
+            
+            # Stop parser thread first
+            self.stop_parser_thread = True
+            if self.parser_thread:
+                self.parser_thread.join(timeout=3.0)
+                if self.parser_thread.is_alive():
+                    print("Warning: Parser thread did not stop cleanly")
+            
+            # Stop reader thread
+            self.stop_reader_thread = True
+            if self.reader_thread:
+                self.reader_thread.join(timeout=3.0)
+                if self.reader_thread.is_alive():
+                    print("Warning: Reader thread did not stop cleanly")
+            
+            print("Fast serial reader and parser threads stopped")
+    
+    def _fast_serial_reader(self):
+        """Fast serial reader thread with large buffers"""
+        self.logger.info("Fast serial reader started")
+        
+        while not self.stop_reader_thread:
+            try:
+                current_time = time.time()
+                
+                # Check connection health
+                if not self._is_connection_healthy():
+                    if not self._reconnect():
+                        time.sleep(1.0)
+                        continue
+                
+                with self.connection_lock:
+                    if not self.ser or not self.ser.is_open:
+                        time.sleep(0.1)
+                        continue
+                    
+                    try:
+                        # Read with large buffer for efficiency
+                        bytes_waiting = self.ser.in_waiting
+                        
+                        if bytes_waiting > 0:
+                            # Read up to buffer size for efficiency
+                            read_size = min(bytes_waiting, self.serial_buffer_size)
+                            data = self.ser.read(read_size)
+                            
+                            if data:
+                                self.last_successful_read = current_time
+                                self.last_any_activity = current_time
+                                
+                                # Add to internal buffer
+                                self.serial_read_buffer.extend(data)
+                                
+                                # Process complete lines from buffer
+                                self._process_buffer_lines()
+                            else:
+                                time.sleep(0.001)  # Very short sleep
+                        else:
+                            # No data available
+                            self.last_any_activity = current_time
+                            time.sleep(0.001)  # Very short sleep
+                            
+                    except (OSError, serial.SerialException) as e:
+                        self.logger.error(f"Serial communication error: {e}")
+                        self.is_connected = False
+                        time.sleep(0.5)
+                        continue
+                        
+            except Exception as e:
+                self.logger.error(f"Fast serial reader error: {e}")
+                import traceback
+                traceback.print_exc()
+                time.sleep(0.5)
+        
+        self.logger.info("Fast serial reader stopped")
+    
+    def _async_parser(self):
+        """Async parser thread for processing queued data"""
+        self.logger.info("Async parser started")
+        
+        while not self.stop_parser_thread:
+            try:
+                # Get data from parsing queue with timeout
+                try:
+                    data_item = self.parsing_queue.get(timeout=0.1)
+                    
+                    # Process the data item
+                    if data_item['type'] == 'line':
+                        self._process_line(data_item['data'])
+                    elif data_item['type'] == 'binary':
+                        self._process_binary_data(data_item['data'])
+                    
+                    # Mark task as done
+                    self.parsing_queue.task_done()
+                    
+                except queue.Empty:
+                    # No data in queue, continue
+                    continue
+                    
+            except Exception as e:
+                self.logger.error(f"Async parser error: {e}")
+                import traceback
+                traceback.print_exc()
+                time.sleep(0.1)
+        
+        self.logger.info("Async parser stopped")
+    
+    def _process_buffer_lines(self):
+        """Process complete lines from the serial read buffer"""
+        try:
+            # Convert buffer to string for line processing
+            buffer_str = self.serial_read_buffer.decode('utf-8', errors='ignore')
+            
+            # Find complete lines
+            lines = buffer_str.split('\n')
+            
+            # Keep the last incomplete line in buffer
+            if buffer_str.endswith('\n'):
+                # All lines are complete
+                self.serial_read_buffer.clear()
+            else:
+                # Keep incomplete line in buffer
+                if lines:
+                    incomplete_line = lines[-1]
+                    self.serial_read_buffer = bytearray(incomplete_line.encode('utf-8'))
+                else:
+                    self.serial_read_buffer.clear()
+            
+            # Process complete lines
+            for line in lines[:-1] if not buffer_str.endswith('\n') else lines:
+                if line.strip():
+                    # Queue line for async processing
+                    try:
+                        self.parsing_queue.put_nowait({
+                            'type': 'line',
+                            'data': line.strip()
+                        })
+                    except queue.Full:
+                        self.logger.warning("Parsing queue full, dropping line")
+                        
+        except Exception as e:
+            self.logger.error(f"Error processing buffer lines: {e}")
+            # Clear buffer on error
+            self.serial_read_buffer.clear()
             
     def _receiver_thread(self):
         """Enhanced receiver thread"""
@@ -1019,18 +1443,23 @@ class HostTimingSeismicAcquisition:
         return self._connect()
 
     def _process_raw_data(self, data):
-        """Process raw bytes into lines"""
+        """Process raw bytes into lines or binary frames"""
         try:
-            text = data.decode('ascii', errors='replace')
-            self.line_buffer += text
-            
-            lines_processed = 0
-            while '\n' in self.line_buffer and lines_processed < 100:
-                line, self.line_buffer = self.line_buffer.split('\n', 1)
-                line = line.strip()
-                if line:
-                    self._process_line(line)
-                    lines_processed += 1
+            if self.binary_mode_enabled:
+                # Process binary data
+                self._process_binary_data(data)
+            else:
+                # Process text data
+                text = data.decode('ascii', errors='replace')
+                self.line_buffer += text
+                
+                lines_processed = 0
+                while '\n' in self.line_buffer and lines_processed < 100:
+                    line, self.line_buffer = self.line_buffer.split('\n', 1)
+                    line = line.strip()
+                    if line:
+                        self._process_line(line)
+                        lines_processed += 1
                     
             # Prevent buffer from growing too large
             if len(self.line_buffer) > 10000:
@@ -1058,6 +1487,15 @@ class HostTimingSeismicAcquisition:
             
             if prefix == "STATUS":
                 self._handle_status_message(data)
+            
+            elif prefix == "BOOT":
+                self._handle_boot_message(data)
+            
+            elif prefix == "STAT":
+                self._handle_stat_message(data)
+            
+            elif prefix == "OFLOW":
+                self._handle_overflow_message(data)
                     
             elif prefix == "ERROR":
                 print(f"MCU Error: {data}")
@@ -1174,8 +1612,11 @@ class HostTimingSeismicAcquisition:
                 
                 self._last_processed_sequence = sequence
                 
-                # CRITICAL: Generate host timestamp using UNIFIED timing system ONLY
-                host_timestamp = self.timing_adapter.generate_timestamp(sequence)
+                # CRITICAL: Generate host timestamp using MCU timestamp as primary time axis
+                host_timestamp = self.timing_adapter.generate_timestamp(
+                    sequence, 
+                    mcu_timestamp_us=mcu_micros
+                )
                 
                 # VERIFY: Timestamp is quantized (should end with 0 for proper quantization)
                 quantization_ms = getattr(self.timing_adapter.timestamp_generator, 'quantization_ms', 10)
@@ -1536,10 +1977,18 @@ class HostTimingSeismicAcquisition:
         return self.current_dithering
         
     def start_streaming(self, rate=None):
-        """Start continuous data streaming with synchronized start (with fallback)"""
+        """Start continuous data streaming with synchronized start (with fallback) and session header logging"""
         if self.streaming:
             print("Already streaming, ignoring start request")
             return (True, "Already streaming")
+        
+        # Generate session header before starting streaming
+        session_header = self.generate_session_header()
+        if session_header:
+            print(f"📋 SESSION HEADER: {session_header['session_id']}")
+            print(f"   MCU Config: {session_header['mcu_config']}")
+            print(f"   Timing Info: {session_header['timing_info']}")
+            print(f"   Performance Info: {session_header['performance_info']}")
         
         # Update timestamp generator rate
         actual_rate = rate if rate else 100.0
@@ -1824,6 +2273,714 @@ class HostTimingSeismicAcquisition:
                 except:
                     pass
                 self.ser = None
+    
+    def start_enhanced_features(self):
+        """Start enhanced features like calibration monitoring and stat reporting"""
+        if not self.running:
+            return
+            
+        # Start calibration monitoring thread
+        self.stop_calibration_thread = False
+        self.calibration_thread = threading.Thread(target=self._calibration_monitor, daemon=True)
+        self.calibration_thread.start()
+        
+        # Start stat reporting thread
+        self.stop_stat_thread = False
+        self.stat_thread = threading.Thread(target=self._stat_reporter, daemon=True)
+        self.stat_thread.start()
+        
+        # Start adaptive calibration monitoring thread
+        self.stop_adaptive_calibration_thread = False
+        self.adaptive_calibration_thread = threading.Thread(target=self._adaptive_calibration_monitor, daemon=True)
+        self.adaptive_calibration_thread.start()
+        
+        self.logger.info("Enhanced features started: calibration monitoring, stat reporting, adaptive calibration")
+    
+    def stop_enhanced_features(self):
+        """Stop enhanced features"""
+        self.stop_calibration_thread = True
+        self.stop_stat_thread = True
+        self.stop_adaptive_calibration_thread = True
+        
+        if self.calibration_thread and self.calibration_thread.is_alive():
+            self.calibration_thread.join(timeout=1.0)
+        
+        if self.stat_thread and self.stat_thread.is_alive():
+            self.stat_thread.join(timeout=1.0)
+            
+        if self.adaptive_calibration_thread and self.adaptive_calibration_thread.is_alive():
+            self.adaptive_calibration_thread.join(timeout=1.0)
+        
+        self.logger.info("Enhanced features stopped")
+    
+    def _adaptive_calibration_monitor(self):
+        """Monitor offset drift and apply adaptive calibration corrections"""
+        last_calibration_time = 0
+        calibration_interval = 20.0  # Apply adaptive calibration every 20 seconds
+        offset_history = []  # Track recent offset values
+        max_history = 5  # Keep last 5 offset readings
+
+        while not self.stop_adaptive_calibration_thread:
+            try:
+                current_time = time.time()
+
+                # Get current timing status
+                timing_info = self.timing_adapter.get_timing_info()
+                offset_ms = timing_info.get('timestamp_health', {}).get('offset_ms', 0)
+
+                # Maintain offset history for trend analysis
+                offset_history.append(offset_ms)
+                if len(offset_history) > max_history:
+                    offset_history.pop(0)
+
+                # Get current MCU calibration
+                mcu_status = self.get_mcu_status()
+                current_calibration = mcu_status.get('calibration_ppm', 0)
+
+                # Check if it's time for adaptive calibration
+                if current_time - last_calibration_time >= calibration_interval:
+                    # Analyze offset trend
+                    if len(offset_history) >= 3:
+                        # Calculate average offset and trend
+                        avg_offset = sum(offset_history) / len(offset_history)
+                        trend = offset_history[-1] - offset_history[0] if len(offset_history) >= 2 else 0
+
+                        # Trigger calibration if:
+                        # 1. Average offset > 3ms, OR
+                        # 2. Trend shows increasing drift (>1ms over history), OR
+                        # 3. Current offset > 5ms
+                        trigger_calibration = (abs(avg_offset) > 3.0 or
+                                            abs(trend) > 1.0 or
+                                            abs(offset_ms) > 5.0)
+
+                        if trigger_calibration:
+                            # Calculate adaptive correction (15% of average offset)
+                            offset_correction_factor = 0.15
+                            ppm_adjustment = -avg_offset * offset_correction_factor
+
+                            # Apply bounds to prevent extreme corrections
+                            max_adjustment = 4.0  # Maximum 4 ppm adjustment per cycle
+                            ppm_adjustment = max(-max_adjustment, min(max_adjustment, ppm_adjustment))
+
+                            new_calibration = current_calibration + ppm_adjustment
+
+                            # Apply hard limits
+                            new_calibration = max(-200.0, min(200.0, new_calibration))
+
+                            # Only apply if adjustment is significant (>0.1 ppm)
+                            if abs(ppm_adjustment) > 0.1:
+                                # Send calibration to MCU
+                                command = f"SET_CAL_PPM:{new_calibration:.2f}"
+                                result = self._send_command(command, timeout=5.0)
+
+                                if result and result[0]:
+                                    # Save to persistent storage
+                                    self.calibration_storage.save_calibration(
+                                        self.device_id,
+                                        new_calibration,
+                                        "adaptive",
+                                        notes=f"Adaptive correction: avg_offset={avg_offset:.1f}ms, trend={trend:.1f}ms, adjustment={ppm_adjustment:.2f}ppm"
+                                    )
+
+                                    self.logger.info(f"🔧 ADAPTIVE CALIBRATION: {current_calibration:.2f} → {new_calibration:.2f} ppm (avg_offset: {avg_offset:.1f}ms, trend: {trend:.1f}ms, adjustment: {ppm_adjustment:.2f}ppm)")
+                                    last_calibration_time = current_time
+                                    offset_history = []  # Reset history after successful calibration
+                                else:
+                                    self.logger.warning(f"Adaptive calibration rejected by MCU: {result[1] if result else 'timeout'}")
+                            else:
+                                self.logger.debug(f"Adaptive calibration: calculated adjustment {ppm_adjustment:.2f}ppm too small")
+                        else:
+                            self.logger.debug(f"Adaptive calibration: avg_offset {avg_offset:.1f}ms, trend {trend:.1f}ms within acceptable range")
+                    else:
+                        self.logger.debug(f"Adaptive calibration: insufficient history ({len(offset_history)} samples)")
+
+                # Sleep for 10 seconds before next check
+                time.sleep(10.0)
+
+            except Exception as e:
+                self.logger.error(f"Error in adaptive calibration monitor: {e}")
+                time.sleep(30.0)  # Wait longer on error
+    
+    def _calibration_monitor(self):
+        """Monitor calibration and push to MCU when stable"""
+        self.logger.info("Calibration monitor started")
+        
+        while not self.stop_calibration_thread:
+            try:
+                time.sleep(10)  # Check every 10 seconds
+                
+                # Check if PPS is stable and calibration should be updated
+                if (self.mcu_status['pps_valid'] and 
+                    self.stable_pps_start_time and 
+                    time.time() - self.stable_pps_start_time > self.stable_pps_threshold_ms / 1000):
+                    self._update_calibration_from_pps()
+                
+                # Handle boot handshake if needed
+                if (self.mcu_status['calibration_valid'] and 
+                    not self.mcu_status['pps_valid']):
+                    self._handle_boot_handshake()
+                    
+            except Exception as e:
+                self.logger.error(f"Error in calibration monitor: {e}")
+        
+        self.logger.info("Calibration monitor stopped")
+    
+    def _stat_reporter(self):
+        """Report MCU status periodically with 1 Hz STAT line"""
+        self.logger.info("Stat reporter started")
+        
+        while not self.stop_stat_thread:
+            try:
+                if self.is_connected and self.ser:
+                    # Request 1 Hz STAT line from MCU
+                    self._send_command("GET_STATUS", timeout=1.0)
+                    
+                    # Also log current timing status
+                    if hasattr(self, 'timing_adapter'):
+                        timing_info = self.timing_adapter.get_timing_info()
+                        self.logger.debug(f"TIMING STAT: source={timing_info.get('timing_source', 'UNKNOWN')}, "
+                                        f"accuracy={timing_info.get('accuracy_us', 0)}μs, "
+                                        f"calibration={timing_info.get('calibration_ppm', 0)}ppm, "
+                                        f"pps_valid={timing_info.get('pps_valid', False)}")
+                
+                time.sleep(1.0)  # Report every second
+                
+            except Exception as e:
+                self.logger.debug(f"Error in stat reporter: {e}")
+                time.sleep(5.0)  # Longer sleep on error
+        
+        self.logger.info("Stat reporter stopped")
+    
+    def _handle_boot_message(self, data):
+        """Handle BOOT message from MCU"""
+        try:
+            # Parse BOOT:device=XIAO-1234,boot_id=1,fw=1.8.3
+            parts = data.split(',')
+            boot_info = {}
+            for part in parts:
+                if '=' in part:
+                    key, value = part.split('=', 1)
+                    boot_info[key.strip()] = value.strip()
+            
+            # Update session info with gap detection
+            if 'boot_id' in boot_info:
+                new_boot_id = int(boot_info['boot_id'])
+                old_boot_id = self.session_info.get('boot_id')
+                
+                # Detect session gap
+                if old_boot_id is not None and new_boot_id != old_boot_id:
+                    self.detect_session_gap(new_boot_id, self.session_info.get('stream_id', 0))
+                
+                self.session_info['boot_id'] = new_boot_id
+            
+            if 'device' in boot_info:
+                self.device_id = boot_info['device']
+            
+            # Generate session header if this is a new session
+            if not self.session_info.get('session_header_received', False):
+                self.generate_session_header()
+                self.session_info['session_header_received'] = True
+            
+            self.logger.info(f"MCU Boot: {boot_info}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to parse BOOT message: {e}")
+    
+    def _handle_stat_message(self, data):
+        """Handle STAT message from MCU"""
+        try:
+            # Parse STAT:INTERNAL_RAW,1000.0,0.00,0,1000,0,NONE,0,0,0,1,0,0
+            parts = data.split(',')
+            if len(parts) >= 13:
+                stat_info = {
+                    'timing_source': parts[0],
+                    'accuracy_us': float(parts[1]),
+                    'calibration_ppm': float(parts[2]),
+                    'calibration_valid': int(parts[3]) == 1,
+                    'pps_age_ms': int(parts[4]),
+                    'pps_valid': int(parts[5]) == 1,
+                    'calibration_source': parts[6],
+                    'boot_id': int(parts[7]),
+                    'stream_id': int(parts[8]),
+                    'buffer_overflows': int(parts[9]),
+                    'samples_skipped': int(parts[10]),
+                    'temperature_c': float(parts[11]),
+                    'firmware_version': parts[12] if len(parts) > 12 else 'unknown'
+                }
+                
+                # Update MCU status
+                self.mcu_status.update(stat_info)
+                
+                # Check for stream_id changes (session gap detection)
+                if 'stream_id' in stat_info:
+                    new_stream_id = stat_info['stream_id']
+                    old_stream_id = self.session_info.get('stream_id')
+                    
+                    if old_stream_id is not None and new_stream_id != old_stream_id:
+                        self.detect_session_gap(self.session_info.get('boot_id', 0), new_stream_id)
+                    
+                    self.session_info['stream_id'] = new_stream_id
+                
+                # Update timing adapter with MCU status
+                if hasattr(self, 'timing_adapter'):
+                    self.timing_adapter.update_mcu_status(stat_info)
+                
+                # Log comprehensive STAT line information
+                self.logger.info(f"MCU STAT: source={stat_info['timing_source']}, "
+                               f"accuracy={stat_info['accuracy_us']}μs, "
+                               f"calibration={stat_info['calibration_ppm']}ppm, "
+                               f"calibration_valid={stat_info['calibration_valid']}, "
+                               f"pps_valid={stat_info['pps_valid']}, "
+                               f"pps_age={stat_info['pps_age_ms']}ms, "
+                               f"calibration_source={stat_info['calibration_source']}, "
+                               f"boot_id={stat_info['boot_id']}, "
+                               f"stream_id={stat_info['stream_id']}, "
+                               f"overflows={stat_info['buffer_overflows']}, "
+                               f"skipped={stat_info['samples_skipped']}, "
+                               f"temp={stat_info['temperature_c']}°C")
+                
+        except Exception as e:
+            self.logger.error(f"Failed to parse STAT message: {e}")
+    
+    def _handle_overflow_message(self, data):
+        """Handle OFLOW message from MCU"""
+        try:
+            # Parse OFLOW:buffer_overflows=5,samples_skipped=10,timestamp=1234567890
+            parts = data.split(',')
+            overflow_info = {}
+            for part in parts:
+                if '=' in part:
+                    key, value = part.split('=', 1)
+                    overflow_info[key.strip()] = value.strip()
+            
+            # Update flow control statistics
+            current_time = time.time() * 1000  # Convert to milliseconds
+            self.flow_control['overflow_count'] += 1
+            self.flow_control['last_overflow_time'] = current_time
+            self.flow_control['overflow_history'].append({
+                'timestamp': current_time,
+                'buffer_overflows': int(overflow_info.get('buffer_overflows', 0)),
+                'samples_skipped': int(overflow_info.get('samples_skipped', 0))
+            })
+            
+            # Check if backpressure should be triggered
+            if self.flow_control['enabled']:
+                self._check_backpressure_trigger()
+            
+            self.logger.warning(f"MCU Overflow: {overflow_info}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to parse OFLOW message: {e}")
+    
+    def _check_backpressure_trigger(self):
+        """Check if backpressure should be triggered based on overflow conditions"""
+        try:
+            current_time = time.time() * 1000
+            
+            # Check if we're already in backpressure mode
+            if self.flow_control['backpressure_active']:
+                # Check if backpressure duration has expired
+                if (current_time - self.flow_control['last_flow_control_time']) > self.flow_control['backpressure_duration_ms']:
+                    self._disable_backpressure()
+                return
+            
+            # Check overflow threshold
+            if self.flow_control['overflow_count'] >= self.flow_control['overflow_threshold']:
+                self._enable_backpressure()
+                
+        except Exception as e:
+            self.logger.error(f"Error checking backpressure trigger: {e}")
+    
+    def _enable_backpressure(self):
+        """Enable backpressure to reduce MCU buffer pressure"""
+        try:
+            current_time = time.time() * 1000
+            self.flow_control['backpressure_active'] = True
+            self.flow_control['last_flow_control_time'] = current_time
+            self.flow_control['backpressure_requests'] += 1
+            
+            # Send backpressure command to MCU
+            result = self._send_command("BACKPRESSURE:ON", timeout=1.0)
+            if result and result[0]:
+                self.flow_control['backpressure_responses'] += 1
+                self.logger.info("Backpressure enabled - MCU buffer pressure reduced")
+            else:
+                self.logger.warning("Failed to enable backpressure on MCU")
+                
+        except Exception as e:
+            self.logger.error(f"Error enabling backpressure: {e}")
+    
+    def _disable_backpressure(self):
+        """Disable backpressure to resume normal operation"""
+        try:
+            self.flow_control['backpressure_active'] = False
+            self.flow_control['overflow_count'] = 0  # Reset counter
+            
+            # Send backpressure disable command to MCU
+            result = self._send_command("BACKPRESSURE:OFF", timeout=1.0)
+            if result and result[0]:
+                self.logger.info("Backpressure disabled - normal operation resumed")
+            else:
+                self.logger.warning("Failed to disable backpressure on MCU")
+                
+        except Exception as e:
+            self.logger.error(f"Error disabling backpressure: {e}")
+    
+    def get_calibration_status(self):
+        """Get MCU calibration status"""
+        try:
+            # Load stored calibration
+            stored_cal = self.calibration_storage.load_calibration(self.device_id)
+            
+            return {
+                'stored_calibration': stored_cal,
+                'mcu_calibration': self.mcu_status.get('calibration_ppm', 0.0),
+                'mcu_calibration_valid': self.mcu_status.get('calibration_valid', False),
+                'mcu_calibration_source': self.mcu_status.get('calibration_source', 'NONE'),
+                'pps_valid': self.mcu_status.get('pps_valid', False),
+                'timing_source': self.mcu_status.get('timing_source', 'UNKNOWN'),
+                'accuracy_us': self.mcu_status.get('accuracy_us', 1000000)
+            }
+        except Exception as e:
+            self.logger.error(f"Failed to get calibration status: {e}")
+            return {'error': str(e)}
+    
+    def set_calibration(self, ppm_value: float, source: str = "manual", notes: str = "") -> bool:
+        """Set calibration value with sanity checks"""
+        try:
+            # Apply hard limits and sanity checks (±200 ppm)
+            clamped_ppm = max(-200.0, min(200.0, ppm_value))
+            
+            if abs(clamped_ppm - ppm_value) > 0.1:
+                self.logger.warning(f"Calibration clamped: {ppm_value:.2f} → {clamped_ppm:.2f} ppm (limit: ±200 ppm)")
+                notes += f" [CLAMPED from {ppm_value:.2f} ppm]"
+            
+            # Sanity check for reasonable values
+            if abs(clamped_ppm) > 100:
+                self.logger.warning(f"Large calibration value: {clamped_ppm:.2f} ppm (source: {source})")
+            
+            # Save to storage (storage will also apply its own checks)
+            if self.calibration_storage.save_calibration(self.device_id, clamped_ppm, source, notes):
+                # Send to MCU
+                if self._send_calibration_to_mcu(clamped_ppm):
+                    self.logger.info(f"Set calibration: {clamped_ppm:.2f} ppm from {source}")
+                    return True
+                else:
+                    self.logger.error(f"Failed to send calibration to MCU: {clamped_ppm:.2f} ppm")
+                    return False
+            else:
+                self.logger.error(f"Failed to save calibration: {clamped_ppm:.2f} ppm")
+                return False
+        except Exception as e:
+            self.logger.error(f"Failed to set calibration: {e}")
+            return False
+    
+    def clear_calibration(self) -> bool:
+        """Clear calibration"""
+        try:
+            # Clear from storage
+            if self.calibration_storage.clear_calibration(self.device_id):
+                # Send clear command to MCU
+                result = self._send_command("CAL_CLEAR", timeout=2.0)
+                if result and result[0] and "OK:Calibration cleared" in result[1]:
+                    self.logger.info("Cleared calibration")
+                    return True
+                else:
+                    self.logger.error("Failed to clear calibration")
+                    return False
+            else:
+                self.logger.error("Failed to clear calibration")
+                return False
+        except Exception as e:
+            self.logger.error(f"Failed to clear calibration: {e}")
+            return False
+    
+    def get_mcu_status(self):
+        """Get MCU status"""
+        return self.mcu_status
+    
+    def get_session_info(self):
+        """Get session information"""
+        return self.session_info
+    
+    def generate_session_header(self):
+        """Generate session header with comprehensive MCU metadata"""
+        try:
+            import uuid
+            from datetime import datetime
+            
+            # Generate unique session ID
+            session_id = str(uuid.uuid4())
+            current_time = datetime.utcnow()
+            
+            # Create comprehensive session header with MCU configuration
+            session_header = {
+                'session_id': session_id,
+                'boot_id': self.session_info.get('boot_id'),
+                'stream_id': self.session_info.get('stream_id'),
+                'device_id': self.device_id,
+                'start_timestamp_utc': current_time.isoformat() + 'Z',
+                'start_timestamp_unix': current_time.timestamp(),
+                'pps_locked_start': self.session_info.get('pps_locked_start', False),
+                'firmware_version': self.mcu_status.get('firmware_version', 'unknown'),
+                'calibration_ppm': self.mcu_status.get('calibration_ppm', 0.0),
+                'timing_source': self.mcu_status.get('timing_source', 'UNKNOWN'),
+                
+                # MCU Configuration Fields
+                'mcu_config': {
+                    'sampling_rate_hz': self.mcu_status.get('sampling_rate_hz', 100.0),
+                    'adc_rate': self.mcu_status.get('adc_rate', 13),
+                    'adc_gain': self.mcu_status.get('adc_gain', 1),
+                    'channels': self.mcu_status.get('channels', 3),
+                    'oversample_factor': self.mcu_status.get('oversample_factor', 4),
+                    'filter_type': self.mcu_status.get('filter_type', 'SINC3'),
+                    'filter_index': self.mcu_status.get('filter_index', 1),
+                    'dithering_enabled': self.mcu_status.get('dithering_enabled', True),
+                    'binary_mode': self.mcu_status.get('binary_mode', False),
+                    'compact_output': self.mcu_status.get('compact_output', False)
+                },
+                
+                # Timing and Quality Fields
+                'timing_info': {
+                    'timing_accuracy_us': self.mcu_status.get('timing_accuracy_us', 1000.0),
+                    'calibration_valid': self.mcu_status.get('calibration_valid', False),
+                    'calibration_source': self.mcu_status.get('calibration_source', 'NONE'),
+                    'pps_valid': self.mcu_status.get('pps_valid', False),
+                    'pps_age_ms': self.mcu_status.get('pps_age_ms', 0),
+                    'temperature_c': self.mcu_status.get('temperature_c', 0.0)
+                },
+                
+                # Performance and Quality Fields
+                'performance_info': {
+                    'buffer_overflows': self.mcu_status.get('buffer_overflows', 0),
+                    'samples_skipped': self.mcu_status.get('samples_skipped', 0),
+                    'sequence_gaps_detected': self.mcu_status.get('sequence_gaps_detected', 0),
+                    'sequence_resets_detected': self.mcu_status.get('sequence_resets_detected', 0),
+                    'throughput_margin_ok': self.mcu_status.get('throughput_margin_ok', True)
+                },
+                
+                # Session Metadata
+                'session_metadata': {
+                    'host_version': '1.0.0',
+                    'python_version': '3.x',
+                    'platform': 'raspberry_pi',
+                    'reconstruction_enabled': self.session_info.get('session_reconstruction_enabled', True),
+                    'binary_framing_enabled': self.binary_mode_enabled,
+                    'flow_control_enabled': self.flow_control.get('enabled', False),
+                    'fast_serial_reader_enabled': True,
+                    'session_logging_enabled': True
+                }
+            }
+            
+            # Update session info
+            self.session_info['session_id'] = session_id
+            self.session_info['session_start_timestamp'] = current_time.timestamp()
+            self.session_info['session_metadata'] = session_header['session_metadata']
+            
+            # Log session start
+            self._log_session_event('SESSION_START', session_header)
+            
+            self.logger.info(f"Session header generated: {session_id}")
+            return session_header
+            
+        except Exception as e:
+            self.logger.error(f"Failed to generate session header: {e}")
+            return None
+    
+    def _log_session_event(self, event_type: str, data: dict = None):
+        """Log session event for reconstruction"""
+        try:
+            event = {
+                'timestamp': time.time(),
+                'event_type': event_type,
+                'data': data or {}
+            }
+            self.session_info['session_log'].append(event)
+            
+            # Keep only last 1000 events
+            if len(self.session_info['session_log']) > 1000:
+                self.session_info['session_log'] = self.session_info['session_log'][-1000:]
+                
+        except Exception as e:
+            self.logger.error(f"Failed to log session event: {e}")
+    
+    def detect_session_gap(self, new_boot_id: int, new_stream_id: int):
+        """Detect session gaps for reconstruction"""
+        try:
+            current_boot_id = self.session_info.get('boot_id')
+            current_stream_id = self.session_info.get('stream_id')
+            
+            gap_detected = False
+            gap_info = {}
+            
+            if current_boot_id is not None and new_boot_id != current_boot_id:
+                gap_detected = True
+                gap_info['type'] = 'boot_id_change'
+                gap_info['old_boot_id'] = current_boot_id
+                gap_info['new_boot_id'] = new_boot_id
+                self.logger.warning(f"Session gap detected: Boot ID changed {current_boot_id} -> {new_boot_id}")
+            
+            if current_stream_id is not None and new_stream_id != current_stream_id:
+                gap_detected = True
+                gap_info['type'] = 'stream_id_change'
+                gap_info['old_stream_id'] = current_stream_id
+                gap_info['new_stream_id'] = new_stream_id
+                self.logger.warning(f"Session gap detected: Stream ID changed {current_stream_id} -> {new_stream_id}")
+            
+            if gap_detected:
+                self.session_info['session_gap_detected'] = True
+                self._log_session_event('SESSION_GAP', gap_info)
+                
+                # Store previous session info for stitching
+                self.session_info['last_session_id'] = self.session_info.get('session_id')
+                
+                # Generate new session header
+                new_header = self.generate_session_header()
+                if new_header:
+                    self.logger.info(f"New session started after gap: {new_header['session_id']}")
+            
+            return gap_detected, gap_info
+            
+        except Exception as e:
+            self.logger.error(f"Failed to detect session gap: {e}")
+            return False, {}
+    
+    def get_session_reconstruction_data(self):
+        """Get data needed for session reconstruction"""
+        try:
+            return {
+                'current_session': self.session_info,
+                'session_log': self.session_info.get('session_log', []),
+                'mcu_status': self.mcu_status,
+                'flow_control_status': self.get_flow_control_status(),
+                'binary_mode_status': self.get_binary_mode_status(),
+                'calibration_status': self.get_calibration_status()
+            }
+        except Exception as e:
+            self.logger.error(f"Failed to get session reconstruction data: {e}")
+            return None
+    
+    def get_flow_control_status(self):
+        """Get flow control status"""
+        status = dict(self.flow_control)
+        # Convert deque to list for JSON serialization
+        if 'overflow_history' in status:
+            status['overflow_history'] = list(status['overflow_history'])
+        return status
+    
+    def enable_binary_mode(self, enabled: bool = True) -> bool:
+        """Enable/disable binary framing mode"""
+        try:
+            if enabled:
+                result = self._send_command("BINARY_MODE:ON", timeout=2.0)
+                if result and result[0] and "OK:Binary mode enabled" in result[1]:
+                    self.binary_mode_enabled = True
+                    self.logger.info("Binary framing mode enabled")
+                    return True
+                else:
+                    self.logger.warning(f"MCU rejected binary mode: {result[1] if result else 'timeout'}")
+                    return False
+            else:
+                result = self._send_command("BINARY_MODE:OFF", timeout=2.0)
+                if result and result[0] and "OK:Binary mode disabled" in result[1]:
+                    self.binary_mode_enabled = False
+                    self.logger.info("Binary framing mode disabled")
+                    return True
+                else:
+                    self.logger.warning(f"MCU rejected binary mode disable: {result[1] if result else 'timeout'}")
+                    return False
+        except Exception as e:
+            self.logger.error(f"Failed to set binary mode: {e}")
+            return False
+    
+    def get_binary_mode_status(self):
+        """Get binary mode status and statistics"""
+        return {
+            'enabled': self.binary_mode_enabled,
+            'stats': self.binary_frame_stats,
+            'parser_stats': self.binary_parser.get_stats()
+        }
+    
+    def _process_binary_data(self, data: bytes):
+        """Process binary data frames"""
+        try:
+            frames = self.binary_parser.add_data(data)
+            self.binary_frame_stats['frames_received'] += len(frames)
+            
+            for frame in frames:
+                # Parse binary frame payload
+                if len(frame) >= 8:  # Minimum frame size
+                    # Extract frame data (sequence, timestamp, values)
+                    sequence = struct.unpack('<H', frame[0:2])[0]
+                    mcu_timestamp_us = struct.unpack('<Q', frame[2:10])[0]  # 64-bit timestamp
+                    
+                    # Extract sensor values (assuming 3 channels, 4 bytes each)
+                    values = []
+                    for i in range(3):
+                        if len(frame) >= 10 + (i+1)*4:
+                            value = struct.unpack('<f', frame[10+i*4:14+i*4])[0]
+                            values.append(value)
+                    
+                    # Generate timestamp using MCU timestamp
+                    host_timestamp = self.timing_adapter.generate_timestamp(
+                        sequence, 
+                        mcu_timestamp_us=mcu_timestamp_us
+                    )
+                    
+                    # Call data callback
+                    if self.data_callback:
+                        self.data_callback(host_timestamp, sequence, values)
+                    
+                    self.binary_frame_stats['frames_valid'] += 1
+                else:
+                    self.binary_frame_stats['frames_invalid'] += 1
+                    
+        except Exception as e:
+            self.logger.error(f"Error processing binary data: {e}")
+            self.binary_frame_stats['frames_invalid'] += 1
+    
+    def start_streaming_pps(self, rate: float, pps_wait: int = 2) -> Tuple[bool, str]:
+        """Start streaming with PPS-locked synchronization and session header logging"""
+        try:
+            if self.streaming:
+                return False, "Already streaming"
+            
+            if rate < 1 or rate > 1000:
+                return False, "Rate must be between 1 and 1000 Hz"
+            
+            if pps_wait < 1 or pps_wait > 5:
+                return False, "PPS wait count must be between 1 and 5"
+            
+            # Generate session header before starting streaming
+            session_header = self.generate_session_header()
+            if session_header:
+                self.logger.info(f"📋 PPS SESSION HEADER: {session_header['session_id']}")
+                self.logger.info(f"   MCU Config: {session_header['mcu_config']}")
+                self.logger.info(f"   Timing Info: {session_header['timing_info']}")
+                self.logger.info(f"   Performance Info: {session_header['performance_info']}")
+            
+            # Update expected rate
+            self.sample_tracking['expected_rate'] = rate
+            self.timestamp_generator.update_rate(rate)
+            
+            # Send PPS-locked start command
+            command = f"START_STREAM_PPS:{rate},{pps_wait}"
+            result = self._send_command(command, timeout=5.0)
+            
+            if result and result[0]:
+                self.streaming = True
+                self.pps_started = True
+                self.session_info['pps_locked_start'] = True
+                self.session_info['start_time'] = time.time()
+                
+                self.logger.info(f"PPS-locked streaming started: {rate}Hz, waiting for {pps_wait} PPS edges")
+                return True, f"PPS-locked streaming started at {rate}Hz"
+            else:
+                return False, result[1] if result else "Command timeout"
+                
+        except Exception as e:
+            self.logger.error(f"Failed to start PPS streaming: {e}")
+            return False, str(e)
 
 
 class HostTimingManager:
@@ -2273,3 +3430,277 @@ class HostTimingManager:
             'ntp_synced': self.ntp_synced,
             'timing_source': self.timing_quality.get('source', 'Unknown')
         }
+    
+    
+    
+    
+    def _get_mcu_status(self):
+        """Get current MCU status via GET_STATUS command"""
+        try:
+            if not self.ser or not self.ser.is_open:
+                return
+                
+            # Send GET_STATUS command
+            result = self._send_command("GET_STATUS", timeout=2.0)
+            if result and result[0]:
+                # Parse the status response
+                self._parse_status_response(result[1])
+                
+        except Exception as e:
+            self.logger.debug(f"Failed to get MCU status: {e}")
+    
+    def _parse_status_response(self, response: str):
+        """Parse MCU status response with comprehensive field extraction"""
+        if not response.startswith("STATUS:"):
+            return
+            
+        try:
+            # Parse STATUS: format
+            parts = response[7:].split(',')  # Remove "STATUS:" prefix
+            
+            for part in parts:
+                if '=' in part:
+                    key, value = part.split('=', 1)
+                    
+                    # Timing and calibration fields
+                    if key == 'timing_source':
+                        self.mcu_status['timing_source'] = value
+                    elif key == 'accuracy_us':
+                        self.mcu_status['timing_accuracy_us'] = float(value)
+                    elif key == 'calibration_ppm':
+                        self.mcu_status['calibration_ppm'] = float(value)
+                    elif key == 'calibration_valid':
+                        self.mcu_status['calibration_valid'] = value == '1'
+                    elif key == 'calibration_source':
+                        self.mcu_status['calibration_source'] = value
+                    elif key == 'pps_valid':
+                        self.mcu_status['pps_valid'] = value == '1'
+                    elif key == 'pps_age_ms':
+                        self.mcu_status['pps_age_ms'] = int(value)
+                    elif key == 'pps_count':
+                        # Calculate PPS age from count
+                        pass
+                    
+                    # Session tracking fields
+                    elif key == 'boot_id':
+                        self.mcu_status['boot_id'] = value
+                        self.session_info['boot_id'] = value
+                    elif key == 'stream_id':
+                        self.mcu_status['stream_id'] = value
+                        self.session_info['stream_id'] = value
+                    
+                    # Performance and quality fields
+                    elif key == 'buffer_overflows':
+                        self.mcu_status['buffer_overflows'] = int(value)
+                    elif key == 'samples_skipped':
+                        self.mcu_status['samples_skipped'] = int(value)
+                    elif key == 'sequence_gaps_detected':
+                        self.mcu_status['sequence_gaps_detected'] = int(value)
+                    elif key == 'sequence_resets_detected':
+                        self.mcu_status['sequence_resets_detected'] = int(value)
+                    elif key == 'throughput_margin_ok':
+                        self.mcu_status['throughput_margin_ok'] = value == '1'
+                    elif key == 'calibration_ppm':
+                        self.mcu_status['calibration_ppm'] = float(value)
+                    elif key == 'calibration_source':
+                        self.mcu_status['calibration_source'] = value
+                    elif key == 'calibration_valid':
+                        self.mcu_status['calibration_valid'] = value == '1'
+                    elif key == 'last_pps_micros':
+                        self.mcu_status['last_pps_micros'] = int(value)
+
+                    # MCU configuration fields
+                    elif key == 'sampling_rate_hz':
+                        self.mcu_status['sampling_rate_hz'] = float(value)
+                    elif key == 'adc_rate':
+                        self.mcu_status['adc_rate'] = int(value)
+                    elif key == 'adc_gain':
+                        self.mcu_status['adc_gain'] = int(value)
+                    elif key == 'channels':
+                        self.mcu_status['channels'] = int(value)
+                    elif key == 'oversample_factor':
+                        self.mcu_status['oversample_factor'] = int(value)
+                    elif key == 'filter_type':
+                        self.mcu_status['filter_type'] = value
+                    elif key == 'filter_index':
+                        self.mcu_status['filter_index'] = int(value)
+                    elif key == 'dithering_enabled':
+                        self.mcu_status['dithering_enabled'] = value == '1'
+                    elif key == 'binary_mode':
+                        self.mcu_status['binary_mode'] = value == '1'
+                    elif key == 'compact_output':
+                        self.mcu_status['compact_output'] = value == '1'
+                    
+                    # System fields
+                    elif key == 'temperature_c':
+                        self.mcu_status['temperature_c'] = float(value)
+                    elif key == 'firmware_version':
+                        self.mcu_status['firmware_version'] = value
+                        
+        except (ValueError, IndexError) as e:
+            self.logger.debug(f"Failed to parse status response: {e}")
+    
+    def _handle_calibration_logic(self):
+        """Handle calibration logic based on current state"""
+        current_time = time.time()
+        
+        # Check if we have stable PPS
+        if self.mcu_status['timing_source'] == "PPS_ACTIVE" and self.mcu_status['pps_valid']:
+            if self.stable_pps_start_time is None:
+                self.stable_pps_start_time = current_time
+                self.logger.info("PPS lock detected, starting stability timer")
+                
+            # Check if PPS has been stable long enough
+            if (current_time - self.stable_pps_start_time) * 1000 > self.stable_pps_threshold_ms:
+                # PPS has been stable for threshold time
+                self._update_calibration_from_pps()
+                
+        else:
+            # PPS not stable, reset timer
+            if self.stable_pps_start_time is not None:
+                self.logger.info("PPS lost, resetting stability timer")
+                self.stable_pps_start_time = None
+                
+        # Handle boot/reconnect handshake
+        if self.mcu_status['boot_id'] and not self.mcu_status['calibration_valid'] and not self.mcu_status['pps_valid']:
+            self._handle_boot_handshake()
+    
+    def _update_calibration_from_pps(self):
+        """Update calibration.json when PPS is stable and ppm changed"""
+        try:
+            # Load current stored calibration
+            stored_cal = self.calibration_storage.load_calibration(self.device_id)
+            
+            if stored_cal is None:
+                # No stored calibration, save current PPS calibration
+                self.calibration_storage.save_calibration(
+                    self.device_id, 
+                    self.mcu_status['calibration_ppm'], 
+                    "pps",
+                    notes=f"Stable PPS lock for {self.stable_pps_threshold_ms/60000:.1f} minutes"
+                )
+                self.logger.info(f"Saved new PPS calibration: {self.mcu_status['calibration_ppm']} ppm")
+                
+            else:
+                # Check if ppm changed significantly
+                ppm_diff = abs(self.mcu_status['calibration_ppm'] - stored_cal['ppm'])
+                
+                if ppm_diff >= 0.5:  # 0.5 ppm threshold
+                    self.calibration_storage.save_calibration(
+                        self.device_id,
+                        self.mcu_status['calibration_ppm'],
+                        "pps",
+                        notes=f"PPS calibration update: {ppm_diff:.2f} ppm change"
+                    )
+                    self.logger.info(f"Updated PPS calibration: {self.mcu_status['calibration_ppm']} ppm (change: {ppm_diff:.2f} ppm)")
+                    
+        except Exception as e:
+            self.logger.error(f"Failed to update calibration from PPS: {e}")
+    
+    def _handle_boot_handshake(self):
+        """Handle boot/reconnect handshake"""
+        try:
+            # Load stored calibration
+            stored_cal = self.calibration_storage.load_calibration(self.device_id)
+            
+            if stored_cal and self.calibration_push_enabled:
+                # Push stored calibration to MCU
+                ppm_value = stored_cal['ppm']
+                self._send_calibration_to_mcu(ppm_value)
+                
+                self.logger.info(f"Boot handshake: pushed calibration {ppm_value} ppm to MCU")
+                
+        except Exception as e:
+            self.logger.error(f"Failed to handle boot handshake: {e}")
+    
+    def _send_calibration_to_mcu(self, ppm_value: float):
+        """Send calibration to MCU via SET_CAL_PPM command with sanity checks"""
+        try:
+            if not self.ser or not self.ser.is_open:
+                return False
+            
+            # Apply hard limits and sanity checks (±200 ppm)
+            clamped_ppm = max(-200.0, min(200.0, ppm_value))
+            
+            if abs(clamped_ppm - ppm_value) > 0.1:
+                self.logger.warning(f"MCU calibration clamped: {ppm_value:.2f} → {clamped_ppm:.2f} ppm (limit: ±200 ppm)")
+            
+            # Sanity check for reasonable values
+            if abs(clamped_ppm) > 100:
+                self.logger.warning(f"Large MCU calibration value: {clamped_ppm:.2f} ppm")
+                
+            command = f"SET_CAL_PPM:{clamped_ppm:.2f}"
+            result = self._send_command(command, timeout=2.0)
+            
+            if result and result[0] and "OK:Pi calibration set" in result[1]:
+                self.logger.info(f"Successfully sent calibration {clamped_ppm:.2f} ppm to MCU")
+                return True
+            else:
+                self.logger.warning(f"MCU rejected calibration: {result[1] if result else 'timeout'}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Failed to send calibration to MCU: {e}")
+            return False
+    
+    
+    def clear_calibration(self) -> bool:
+        """Clear calibration"""
+        try:
+            # Clear from storage
+            success = self.calibration_storage.clear_calibration(self.device_id)
+            
+            if success:
+                # Send CLEAR_CAL to MCU if connected
+                if self.ser and self.ser.is_open:
+                    result = self._send_command("CLEAR_CAL", timeout=2.0)
+                    if result and result[0]:
+                        self.logger.info("Cleared calibration")
+                        return True
+                    
+            self.logger.error("Failed to clear calibration")
+            return False
+                
+        except Exception as e:
+            self.logger.error(f"Failed to clear calibration: {e}")
+            return False
+    
+    def get_calibration_status(self) -> Dict[str, Any]:
+        """Get current calibration status"""
+        stored_cal = self.calibration_storage.load_calibration(self.device_id)
+        
+        return {
+            "device_id": self.device_id,
+            "mcu_calibration_valid": self.mcu_status['calibration_valid'],
+            "mcu_calibration_ppm": self.mcu_status['calibration_ppm'],
+            "mcu_calibration_source": self.mcu_status['calibration_source'],
+            "mcu_timing_source": self.mcu_status['timing_source'],
+            "mcu_pps_valid": self.mcu_status['pps_valid'],
+            "stored_calibration": stored_cal,
+            "stable_pps": self.stable_pps_start_time is not None
+        }
+    
+    def enable_binary_mode(self, enabled: bool = True) -> bool:
+        """Enable/disable binary framing mode"""
+        try:
+            self.binary_mode_enabled = enabled
+            if enabled:
+                self.logger.info("Binary framing mode enabled")
+            else:
+                self.logger.info("Binary framing mode disabled")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to set binary mode: {e}")
+            return False
+    
+    def get_mcu_status(self) -> Dict[str, Any]:
+        """Get comprehensive MCU status"""
+        return dict(self.mcu_status)
+    
+    def get_session_info(self) -> Dict[str, Any]:
+        """Get current session information"""
+        return dict(self.session_info)
+    
+    def get_flow_control_status(self) -> Dict[str, Any]:
+        """Get flow control status"""
+        return dict(self.flow_control)

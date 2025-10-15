@@ -1,6 +1,6 @@
 [Unit]
-Description=gVsense Seismic Data Acquisition Agent
-Documentation=https://github.com/your-repo/gvsense
+Description=gVsense Calibration Agent
+Documentation=https://github.com/gvsense/gvsense
 After=network.target
 Wants=network.target
 
@@ -9,25 +9,22 @@ Type=simple
 User=gvsense
 Group=gvsense
 WorkingDirectory=/opt/gvsense
-ExecStart=/usr/bin/python3 /opt/gvsense/enhanced_host_acquisition.py --port /dev/gsense-XIAO-1234 --device-id XIAO-1234
+ExecStart=/usr/bin/python3 /opt/gvsense/web_server.py
 Restart=always
-RestartSec=5
+RestartSec=10
 StandardOutput=journal
 StandardError=journal
+SyslogIdentifier=gvsense-agent
 
-# Environment
-Environment=PYTHONPATH=/opt/gvsense
-Environment=PYTHONUNBUFFERED=1
-
-# Security
+# Security settings
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/gvsense
+ReadWritePaths=/var/lib/gvsense /var/log/gvsense
 
 # Resource limits
-LimitNOFILE=1024
+LimitNOFILE=65536
 MemoryMax=512M
 
 [Install]

@@ -32,9 +32,10 @@ mkdir -p "$INSTALL_DIR"
 # Copy files
 echo "Copying files..."
 cp calibration_storage.py "$INSTALL_DIR/"
-cp enhanced_host_acquisition.py "$INSTALL_DIR/"
+cp host_timing_acquisition.py "$INSTALL_DIR/"
+cp timing_fix.py "$INSTALL_DIR/"
+cp web_server.py "$INSTALL_DIR/"
 cp gvsense-cal "$INSTALL_DIR/"
-cp gvsense-agent.service "$INSTALL_DIR/"
 
 # Make CLI executable
 chmod +x "$INSTALL_DIR/gvsense-cal"
