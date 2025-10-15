@@ -38,6 +38,7 @@ data/
 *.csv
 nohup.out
 *.log
+archive/
 
 # OS
 .DS_Store
