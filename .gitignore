@@ -39,6 +39,7 @@ data/
 nohup.out
 *.log
 archive/
+src/
 
 # OS
 .DS_Store

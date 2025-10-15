@@ -4,7 +4,7 @@
 ## Overview
 Cleaned gVsense workspace by archiving 40+ development/debug files and keeping only 20 production-essential files.
 
-## Production Files Kept (20 files)
+## Production Files Kept (12 files)
 
 ### Core Python Modules (8 files)
 ```
@@ -18,15 +18,10 @@ influx_writer.py                  13 KB   InfluxDB integration
 thingsboard_client.py             15 KB   ThingsBoard integration
 ```
 
-### Configuration & Setup (7 files)
+### Configuration (2 files)
 ```
 config.conf                       2.7 KB   Runtime configuration
 config.conf.template              2.7 KB   Configuration template
-99-gvsense.rules                  574 B    udev device naming rules
-pps_gpio_setup.sh                 3.5 KB   PPS GPIO setup script
-install.sh                        2.2 KB   Installation script
-requirements.txt                  1.3 KB   Python dependencies
-gvsense-cal                       3.3 KB   CLI calibration tool
 ```
 
 ### Firmware & Documentation (2 files)
@@ -35,16 +30,16 @@ src/main.cpp                      ~80 KB   MCU firmware (SAMD21)
 README.md                         3.6 KB   System documentation
 ```
 
-### Directories (3 directories)
+### Directories (5 directories)
 ```
 templates/        HTML templates for web UI
 static/           CSS, JS, images for web UI
 data/             Binary data storage
 session_logs/     Session metadata logs
-__pycache__/      Python bytecode cache (auto-generated)
+archive/          Archived development files
 ```
 
-## Files Archived (40+ files)
+## Files Archived (44+ files)
 
 ### Monitoring Scripts → archive/monitoring_scripts/ (16 files)
 ```
@@ -88,7 +83,7 @@ TIMESTAMP_INTERVAL_FIX.md
 INDEX.md (old archive index)
 ```
 
-### Temporary Files → archive/temp_files/ (8 files)
+### Temporary Files → archive/temp_files/ (12 files)
 ```
 main.cpp                                # Duplicate of src/main.cpp
 FIRMWARE_FIX_PPS_CALIBRATION.cpp       # Old firmware snippet
@@ -98,12 +93,16 @@ timestamp_gaps.log                      # Old log file
 timing_improvement_20251008_204003.png  # Screenshot
 timing_performance_test.png             # Screenshot
 backpressure_monitor.py                 # Empty file (0 bytes)
+99-gvsense.rules                        # udev rules (USB only, not needed)
+gvsense-cal                             # CLI tool (not needed)
+install.sh                              # Installation script (system configured)
+pps_gpio_setup.sh                       # PPS setup (already configured)
 ```
 
 ## Space Saved
-- **Before cleanup:** 50+ files in root directory
-- **After cleanup:** 20 essential files
-- **Reduction:** 60% fewer files in root
+- **Before cleanup:** 56 files in root directory
+- **After cleanup:** 12 essential files
+- **Reduction:** 79% fewer files in root
 
 ## Impact
 ✅ **No functional impact** - All archived files were:

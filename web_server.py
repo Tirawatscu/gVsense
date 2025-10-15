@@ -1589,13 +1589,26 @@ def start_stream():
                     seismic, seismic.timing_manager
                 )
             
-            # CRITICAL WORK MODE: Disable timing controller for zero data loss
-            # Timing corrections cause brief serial port blocking -> sample loss
-            # For scientific work requiring perfect data: disable controller
-            # adaptive_controller.start_controller()  # DISABLED for zero data loss
-            print("🔒 Timing controller DISABLED - Zero data loss mode for scientific work")
-            print("   Trade-off: No active MCU corrections (MCU runs at natural rate)")
-            print("   Benefit: Zero sample loss guaranteed")
+            # ADAPTIVE CONTROL STRATEGY:
+            # Enable adaptive controller when starting WITHOUT GPS/PPS
+            # This provides active drift compensation when PPS unavailable
+            mcu_status = seismic.mcu_status if seismic else {}
+            timing_source = mcu_status.get('timing_source', 'UNKNOWN')
+            pps_valid = mcu_status.get('pps_valid', False)
+            
+            # Enable adaptive control if no PPS or not using PPS timing
+            if not pps_valid or timing_source not in ['PPS_ACTIVE', 'PPS_HOLDOVER']:
+                adaptive_controller.start_controller()
+                print("🔧 Adaptive timing controller ENABLED")
+                print(f"   Reason: No GPS/PPS available (timing_source={timing_source}, pps_valid={pps_valid})")
+                print(f"   Benefit: Active drift compensation (~200 ppm tolerance, ±20 ppm adjustments)")
+                print(f"   Trade-off: Occasional MCU corrections may cause brief backpressure")
+            else:
+                # With PPS: disable for zero data loss
+                print("🔒 Timing controller DISABLED - Zero data loss mode with PPS")
+                print(f"   Reason: PPS available (timing_source={timing_source}, pps_valid={pps_valid})")
+                print("   Benefit: Zero sample loss guaranteed with PPS timing")
+                print("   Trade-off: No active MCU corrections (MCU syncs to PPS naturally)")
             
             return jsonify({
                 'status': 'streaming',

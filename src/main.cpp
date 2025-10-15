@@ -97,12 +97,14 @@ struct AdvancedTiming {
     unsigned long cal_base_millis;      // millis() when calibration established
     uint32_t cal_sample_count;          // Samples since calibration
     bool calibration_valid;
+    bool cal_base_initialized;          // Track if cal_base_micros has been permanently set
     unsigned long cal_applied_at_ms;    // When calibration was applied (for diagnostics)
     
     // Clock Reset Detection and Handling
     unsigned long last_micros;          // Last micros() reading for reset detection
     unsigned long last_millis;          // Last millis() reading
     uint32_t micros_wraparound_count;   // Count of micros() wraparounds
+    // NOTE: sequence_wraparounds calculated as (samples_generated >> 16) to avoid hot-path overhead
     uint64_t virtual_micros_offset;     // Offset to create continuous virtual time
     bool clock_reset_detected;          // Flag for recent reset
     unsigned long reset_detection_time; // When reset was detected
@@ -391,6 +393,7 @@ void setupAdvancedTiming() {
   advanced_timing.pps_received = false;
   advanced_timing.pps_valid = false;
   advanced_timing.last_pps_micros = 0;
+  advanced_timing.last_pps_time = 0;  // ✅ CRITICAL: Initialize to prevent garbage value
   advanced_timing.pps_timeout_ms = 2000;  // 2 second PPS timeout
   advanced_timing.current_source = AdvancedTiming::TIMING_INTERNAL_RAW;
   advanced_timing.oscillator_calibration_ppm = 0.0;
@@ -398,6 +401,7 @@ void setupAdvancedTiming() {
   advanced_timing.pps_miss_count = 0;
   advanced_timing.pps_count = 0;
   advanced_timing.calibration_valid = false;
+  advanced_timing.cal_base_initialized = false;  // FIXED: Initialize calibration base flag
   advanced_timing.calibration_source = AdvancedTiming::CAL_NONE;
   advanced_timing.cal_applied_at_ms = 0;
   
@@ -405,6 +409,7 @@ void setupAdvancedTiming() {
   advanced_timing.last_micros = micros();
   advanced_timing.last_millis = millis();
   advanced_timing.micros_wraparound_count = 0;
+  // NOTE: sequence_wraparounds calculated on-demand from samples_generated
   advanced_timing.virtual_micros_offset = 0;
   advanced_timing.clock_reset_detected = false;
   advanced_timing.reset_detection_time = 0;
@@ -463,7 +468,7 @@ void setupAdvancedTiming() {
 void pps_interrupt() {
   advanced_timing.pps_received = true;
   advanced_timing.pps_micros = micros();
-  advanced_timing.last_pps_time = millis();
+  // NOTE: last_pps_time is now updated in processPPS() for proper interval tracking
 }
 
 void updateTimingSource() {
@@ -681,6 +686,12 @@ void processPPS() {
   unsigned long current_millis = millis();
   
   advanced_timing.pps_count++;
+  
+  // Debug: Confirm processPPS is called
+  if (advanced_timing.pps_count % 20 == 0) {
+    Serial1.print("DEBUG:processPPS called, count=");
+    Serial1.println(advanced_timing.pps_count);
+  }
 
   // ===================================================================
   // CRITICAL FIX: Initialize state FIRST (before any early returns)
@@ -688,10 +699,22 @@ void processPPS() {
   // ===================================================================
   bool first_pps = !advanced_timing.pps_valid;
   
-  // Set these BEFORE any early returns so next PPS can calculate calibration
-  unsigned long prev_pps_micros = advanced_timing.last_pps_micros;
+  // Debug trace
+  if (advanced_timing.pps_count % 20 == 0) {
+    Serial1.println("DEBUG:After first_pps check");
+  }
+  
+  // CRITICAL: Save old last_pps_time BEFORE updating for interval validation
+  unsigned long previous_pps_time = advanced_timing.last_pps_time;
+  
+  // Update last_pps_micros BEFORE any early returns
   advanced_timing.last_pps_micros = pps_micros;
   advanced_timing.last_pps_time = current_millis;
+  
+  // Debug trace
+  if (advanced_timing.pps_count % 20 == 0) {
+    Serial1.println("DEBUG:After time update");
+  }
   
   // Mark PPS as valid after first successful pulse
   if (first_pps) {
@@ -699,6 +722,11 @@ void processPPS() {
     advanced_timing.calibration_valid = true;  // Enable calibration learning
     Serial1.print("DEBUG:GPS PPS acquired - count: ");
     Serial1.println(advanced_timing.pps_count);
+  }
+  
+  // Debug trace
+  if (advanced_timing.pps_count % 20 == 0) {
+    Serial1.println("DEBUG:After pps_valid update");
   }
   
   // ===================================================================
@@ -723,6 +751,11 @@ void processPPS() {
     }
   }
   
+  // Debug trace
+  if (advanced_timing.pps_count % 20 == 0) {
+    Serial1.println("DEBUG:After PPS countdown check");
+  }
+  
   // ===================================================================
   // Skip processing if in clock reset recovery period
   // ===================================================================
@@ -732,11 +765,24 @@ void processPPS() {
     return;  // ✅ Safe to return - state already updated
   }
   
+  // Debug trace
+  if (advanced_timing.pps_count % 20 == 0) {
+    Serial1.println("DEBUG:After reset check");
+  }
+  
   // ===================================================================
   // Validate PPS interval (should be ~1 second)
+  // Skip validation for first TWO pulses (need 2 pulses to measure 1 interval)
   // ===================================================================
-  if (!first_pps) {  // Only validate after first PPS
-    unsigned long pps_interval = current_millis - advanced_timing.last_pps_time;
+  if (advanced_timing.pps_count > 2) {  // Changed from !first_pps to > 2
+    unsigned long pps_interval = current_millis - previous_pps_time;  // Use OLD time!
+    
+    // Debug trace
+    if (advanced_timing.pps_count % 20 == 0) {
+      Serial1.print("DEBUG:PPS interval=");
+      Serial1.print(pps_interval);
+      Serial1.println("ms");
+    }
     
     if (pps_interval < 900 || pps_interval > 1100) {
       Serial1.print("WARNING:Invalid PPS interval: ");
@@ -746,19 +792,45 @@ void processPPS() {
     }
   }
   
+  // Debug trace
+  if (advanced_timing.pps_count % 20 == 0) {
+    Serial1.println("DEBUG:After interval validation");
+  }
+  
   // ===================================================================
-  // Calculate oscillator calibration from PPS interval
+  // FIXED: Calculate oscillator calibration from CUMULATIVE elapsed time
+  // Use RAW micros for learning (pps_micros is captured in interrupt)
   // ===================================================================
+  
+  // DEBUG: Log calibration status periodically
+  if (advanced_timing.pps_count % 20 == 0) {
+    Serial1.print("DEBUG:Calibration check: count=");
+    Serial1.print(advanced_timing.pps_count);
+    Serial1.print(", valid=");
+    Serial1.print(advanced_timing.calibration_valid);
+    Serial1.print(", reset=");
+    Serial1.print(advanced_timing.clock_reset_detected);
+    Serial1.print(", base_init=");
+    Serial1.print(advanced_timing.cal_base_initialized);
+    Serial1.print(", current_ppm=");
+    Serial1.println(advanced_timing.oscillator_calibration_ppm, 2);
+  }
+  
   if (advanced_timing.pps_count > 1 && 
       advanced_timing.calibration_valid && 
-      !advanced_timing.clock_reset_detected && 
-      prev_pps_micros > 0) {  // Use PREVIOUS value before update
+      !advanced_timing.clock_reset_detected &&
+      advanced_timing.cal_base_initialized) {
     
-    // Expected time since last PPS: 1,000,000 μs (exactly 1 second)
-    uint64_t actual_interval = pps_micros - prev_pps_micros;
-
-    // No wraparound handling needed with 64-bit arithmetic
-    float error_ppm = ((float)actual_interval - 1000000.0) / 1000000.0 * 1e6;
+    // Calculate TOTAL elapsed time since FIRST PPS (cumulative)
+    // Use raw micros - both pps_micros and cal_base_micros are in raw domain
+    uint64_t actual_elapsed_us = (uint64_t)pps_micros - advanced_timing.cal_base_micros;
+    
+    // Expected elapsed time = number of PPS intervals * 1 second
+    uint64_t expected_elapsed_us = (uint64_t)(advanced_timing.pps_count - 1) * 1000000UL;
+    
+    // Calculate cumulative PPM error from TOTAL time
+    float error_ppm = ((float)actual_elapsed_us - (float)expected_elapsed_us) / 
+                      (float)expected_elapsed_us * 1e6;
     
     // Sanity check: reject unreasonable errors
     if (abs(error_ppm) < 1000) {  // < 1000 ppm (0.1% error)
@@ -770,8 +842,8 @@ void processPPS() {
         
         Serial1.print("DEBUG:Initial PPS calibration: ");
         Serial1.print(advanced_timing.oscillator_calibration_ppm, 2);
-        Serial1.print(" ppm (interval: ");
-        Serial1.print((unsigned long)actual_interval);
+        Serial1.print(" ppm (cumulative: ");
+        Serial1.print((unsigned long)actual_elapsed_us);
         Serial1.println(" μs)");
       } else {
         // Smooth calibration updates (10% new, 90% old)
@@ -788,11 +860,11 @@ void processPPS() {
         if (advanced_timing.pps_count % 10 == 0) {
           Serial1.print("DEBUG:PPS calibration: ");
           Serial1.print(advanced_timing.oscillator_calibration_ppm, 2);
-          Serial1.print(" ppm, interval: ");
-          Serial1.print((unsigned long)actual_interval);
-          Serial1.print(" μs, error: ");
-          Serial1.print(error_ppm, 2);
-          Serial1.println(" ppm");
+          Serial1.print(" ppm, cumulative_elapsed: ");
+          Serial1.print((unsigned long)actual_elapsed_us);
+          Serial1.print(" us, expected: ");
+          Serial1.print((unsigned long)expected_elapsed_us);
+          Serial1.println(" us");
         }
       }
       
@@ -818,9 +890,32 @@ void processPPS() {
     }
   }
   
-  // Update calibration base times
-  advanced_timing.cal_base_micros = pps_micros;
-  advanced_timing.cal_base_millis = current_millis;
+  // ============================================================================
+  // FIXED: Only set cal_base_micros on FIRST PPS, never reset it
+  // Use RAW micros (not virtual) since pps_micros is captured in interrupt
+  // ============================================================================
+  if (!advanced_timing.cal_base_initialized) {
+    // Establish PERMANENT calibration base on first PPS
+    // Use raw pps_micros directly (captured in interrupt)
+    advanced_timing.cal_base_micros = (uint64_t)pps_micros;
+    advanced_timing.cal_base_millis = current_millis;
+    advanced_timing.cal_base_initialized = true;
+    
+    Serial1.print("DEBUG:PPS calibration base established at ");
+    Serial1.print((unsigned long)pps_micros);
+    Serial1.println("us (raw) - FIXED at this value permanently");
+  }
+
+  // First PPS or reacquisition
+  if (!advanced_timing.pps_valid) {
+    Serial1.print("DEBUG:GPS PPS acquired - count: ");
+    Serial1.println(advanced_timing.pps_count);
+  }
+  
+  // Always update these (but NOT cal_base_micros anymore!)
+  advanced_timing.pps_valid = true;
+  advanced_timing.calibration_valid = true;
+  advanced_timing.last_pps_time = current_millis;
 
   // If we are already streaming (not started on PPS) and this is the first time PPS becomes valid,
   // gently nudge sampling phase to align with PPS without changing long-term rate.
@@ -909,19 +1004,23 @@ void processPPS() {
   }
 }
 
-uint64_t calculateCalibratedTimestamp(uint64_t current_micros) {
+uint64_t calculateCalibratedTimestamp(uint64_t virtual_micros) {
   if (!advanced_timing.calibration_valid) {
-    return current_micros;
+    return virtual_micros;
   }
   
-  // Apply oscillator calibration - use 64-bit arithmetic throughout
-  uint64_t elapsed_micros = current_micros - advanced_timing.cal_base_micros;
+  // Extract raw micros from virtual (remove wraparound offset)
+  uint64_t raw_micros = virtual_micros - advanced_timing.virtual_micros_offset;
   
-  // No wraparound handling needed with 64-bit arithmetic
+  // Calculate elapsed time in raw domain (where calibration was learned)
+  uint64_t elapsed_micros = raw_micros - (unsigned long)advanced_timing.cal_base_micros;
+  
   // Apply PPM correction using 64-bit math
   double corrected_elapsed = (double)elapsed_micros * (1.0 + advanced_timing.oscillator_calibration_ppm / 1e6);
   
-  return advanced_timing.cal_base_micros + (uint64_t)corrected_elapsed;
+  // Convert back to virtual domain
+  uint64_t calibrated_raw = (unsigned long)advanced_timing.cal_base_micros + (uint64_t)corrected_elapsed;
+  return advanced_timing.virtual_micros_offset + calibrated_raw;
 }
 
 void establishSamplingTiming() {
@@ -1086,7 +1185,7 @@ bool validateAndCorrectSequence(uint16_t& seq) {
   
   // Check if sequence matches expected
   if (seq == seq_validator.expected_sequence) {
-    seq_validator.expected_sequence = (seq_validator.expected_sequence + 1) % 65536;
+    seq_validator.expected_sequence++;  // uint16_t naturally wraps at 65536
     return true;
   }
   
@@ -1109,7 +1208,7 @@ bool validateAndCorrectSequence(uint16_t& seq) {
     Serial1.println();
     
     seq_validator.sequence_resets_detected++;
-    seq_validator.expected_sequence = (seq + 1) % 65536;
+    seq_validator.expected_sequence = seq + 1;  // uint16_t naturally wraps at 65536
     return true;
   }
   
@@ -1124,7 +1223,7 @@ bool validateAndCorrectSequence(uint16_t& seq) {
   Serial1.println();
   
   seq_validator.sequence_gaps_detected++;
-  seq_validator.expected_sequence = (seq + 1) % 65536;
+  seq_validator.expected_sequence = seq + 1;  // uint16_t naturally wraps at 65536
   return true;
 }
 
@@ -1185,9 +1284,14 @@ void generatePreciseSample() {
   outputDataWithOverflowProtection(sequence, precise_timestamp, (int)advanced_timing.current_source, 
                                    advanced_timing.timing_accuracy_us, value1, value2, value3);
   
-  sequence = (sequence + 1) % 65536;
+  // Increment sequence (uint16_t naturally wraps at 65536)
+  sequence++;
+  
   advanced_timing.samples_generated++;
   advanced_timing.sample_index++;
+  
+  // NOTE: Wraparound tracking removed from hot path to avoid any timing impact
+  // Wraparounds are now calculated as: samples_generated / 65536
   
   // Track recovery samples after reset
   if (advanced_timing.clock_reset_detected) {
@@ -1486,6 +1590,8 @@ void processLine(String line) {
       Serial1.print(advanced_timing.clock_resets_detected);
       Serial1.print(",wraparounds=");
       Serial1.print(advanced_timing.micros_wraparound_count);
+      Serial1.print(",seq_wraparounds=");
+      Serial1.print((unsigned long)(advanced_timing.samples_generated >> 16));  // Calculate: samples/65536
       Serial1.print(",ref_updates=");
       Serial1.print(advanced_timing.reference_updates_count);
       Serial1.print(",buffer_overflows=");
@@ -1527,6 +1633,8 @@ void processLine(String line) {
       Serial1.print(advanced_timing.clock_resets_detected);
       Serial1.print(",wraparounds=");
       Serial1.print(advanced_timing.micros_wraparound_count);
+      Serial1.print(",seq_wraparounds=");
+      Serial1.print((unsigned long)(advanced_timing.samples_generated >> 16));  // Calculate: samples/65536
       Serial1.print(",virtual_offset=");
       Serial1.print((unsigned long)(advanced_timing.virtual_micros_offset >> 20)); // Show in ~1M increments
       Serial1.print(",reset_detected=");
@@ -1771,17 +1879,18 @@ void sendSessionHeader() {
 }
 
 void clampOscillatorCalibration() {
-  // Hard limits and sanity checks: clamp oscillator_calibration_ppm to ±200 ppm
-  if (advanced_timing.oscillator_calibration_ppm > 200.0) {
+  // Hard limits and sanity checks: clamp oscillator_calibration_ppm to ±500 ppm
+  // Most crystal oscillators are within ±100 ppm, but uncalibrated can be ±250-500 ppm
+  if (advanced_timing.oscillator_calibration_ppm > 500.0) {
     Serial1.print("WARNING:Oscillator calibration clamped from ");
     Serial1.print(advanced_timing.oscillator_calibration_ppm, 2);
-    Serial1.println(" ppm to 200 ppm");
-    advanced_timing.oscillator_calibration_ppm = 200.0;
-  } else if (advanced_timing.oscillator_calibration_ppm < -200.0) {
+    Serial1.println(" ppm to 500 ppm");
+    advanced_timing.oscillator_calibration_ppm = 500.0;
+  } else if (advanced_timing.oscillator_calibration_ppm < -500.0) {
     Serial1.print("WARNING:Oscillator calibration clamped from ");
     Serial1.print(advanced_timing.oscillator_calibration_ppm, 2);
-    Serial1.println(" ppm to -200 ppm");
-    advanced_timing.oscillator_calibration_ppm = -200.0;
+    Serial1.println(" ppm to -500 ppm");
+    advanced_timing.oscillator_calibration_ppm = -500.0;
   }
 }
 

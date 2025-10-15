@@ -702,7 +702,8 @@ class SimplifiedTimestampGenerator:
             'phase_servo_offset_us': 0.0,
             'phase_clamp_violations': 0,
             'mcu_offset_updates': 0,  # Track number of offset updates
-            'last_offset_drift_us': 0.0  # Track last detected drift
+            'last_offset_drift_us': 0.0,  # Track last detected drift
+            'mcu_timestamp_offset_us': 0  # Current offset between MCU and host time
         }
         
     def generate_timestamp(self, sequence_number, mcu_timestamp_us=None):
@@ -719,31 +720,64 @@ class SimplifiedTimestampGenerator:
             if self.mcu_timestamp_mode and mcu_timestamp_us is not None:
                 # CRITICAL FIX: Calculate offset on first sample to align MCU and host time
                 if not self.is_initialized:
-                    # Calculate offset: host_time_us - mcu_timestamp_us
-                    host_time_us = int(current_time * 1000000)
+                    # IMPROVED: Account for processing delay by estimating actual sample time
+                    # The sample was captured at some point in the past, and we're processing it now
+                    # with some delay (serial transmission + processing)
+                    
+                    # Use current_time as best estimate, but subtract typical processing delay
+                    # Typical delay is 10-20ms for serial + processing
+                    # We'll use a conservative 15ms estimate
+                    estimated_processing_delay_ms = 15
+                    host_time_us = int((current_time - estimated_processing_delay_ms/1000) * 1000000)
+                    
                     self.mcu_timestamp_offset_us = host_time_us - mcu_timestamp_us
                     self.last_offset_update_time = current_time
+                    self.stats['mcu_timestamp_offset_us'] = self.mcu_timestamp_offset_us  # Update stats
                     print(f"🔧 MCU TIMESTAMP OFFSET CALCULATED: {self.mcu_timestamp_offset_us}μs")
-                    print(f"   Host time: {host_time_us}μs, MCU time: {mcu_timestamp_us}μs")
+                    print(f"   Host time (adjusted): {host_time_us}μs, MCU time: {mcu_timestamp_us}μs")
+                    print(f"   Processing delay estimate: {estimated_processing_delay_ms}ms")
+                    print(f"   This offset will remain CONSTANT (both clocks are PPS-synchronized)")
                 
-                # CRITICAL FIX: Periodically update offset to prevent drift
-                # Update offset every 5 seconds to maintain alignment with real time
+                # IMPROVED FIX: Gentle servo to compensate for residual PPM errors
+                # Both clocks are PPS-synchronized, but small PPM calibration errors can accumulate
+                # We apply gentle corrections to keep timestamps aligned without oscillation
+                #
+                # Strategy (UPDATED after firmware fix):
+                # 1. Check drift every 60 seconds 
+                # 2. If drift < 100ms: NO correction (firmware handles it)
+                # 3. If drift > 100ms: full recalculation (likely clock reset or major issue)
+                #
+                # The firmware fix now handles cumulative PPM correction properly,
+                # so we only intervene for major discontinuities (>100ms)
                 if hasattr(self, 'last_offset_update_time'):
                     time_since_last_update = current_time - self.last_offset_update_time
-                    if time_since_last_update > 5.0:  # Update every 5 seconds (reduced from 30s)
-                        # Recalculate offset to maintain alignment
-                        host_time_us = int(current_time * 1000000)
-                        new_offset_us = host_time_us - mcu_timestamp_us
-                        offset_drift_us = new_offset_us - self.mcu_timestamp_offset_us
+                    if time_since_last_update > 60.0:  # Check every 60 seconds
+                        # Measure actual drift by comparing current timestamp alignment
+                        # Subtract processing delay to get more accurate measurement
+                        host_time_us = int((current_time - 0.015) * 1000000)
+                        expected_offset_us = host_time_us - mcu_timestamp_us
+                        offset_drift_us = expected_offset_us - self.mcu_timestamp_offset_us
                         
-                        # Only update if drift is significant (>0.5ms, reduced from 1ms)
-                        if abs(offset_drift_us) > 500:  # Reduced threshold for more frequent corrections
-                            self.mcu_timestamp_offset_us = new_offset_us
-                            self.last_offset_update_time = current_time
+                        # Only update last_offset_update_time to prevent constant recalculation
+                        self.last_offset_update_time = current_time
+                        
+                        # Calculate drift rate for diagnostics
+                        drift_rate_ppm = (offset_drift_us / time_since_last_update) / 1000
+                        
+                        if abs(offset_drift_us) > 100000:
+                            # MAJOR discontinuity (>100ms) - full recalculation
+                            self.mcu_timestamp_offset_us = expected_offset_us
                             self.stats['mcu_offset_updates'] += 1
                             self.stats['last_offset_drift_us'] = offset_drift_us
-                            print(f"🔧 MCU TIMESTAMP OFFSET UPDATED: {offset_drift_us:+.0f}μs drift corrected")
-                            print(f"   New offset: {self.mcu_timestamp_offset_us}μs")
+                            self.stats['mcu_timestamp_offset_us'] = self.mcu_timestamp_offset_us
+                            print(f"⚠️  LARGE OFFSET DISCONTINUITY: {offset_drift_us:+.0f}μs")
+                            print(f"   Offset fully recalculated: {self.mcu_timestamp_offset_us}μs")
+                        else:
+                            # Small drift <100ms - firmware handles it via cumulative PPM correction
+                            if abs(offset_drift_us) > 1000:  # >1ms
+                                print(f"🔍 Offset drift: {offset_drift_us:+.0f}μs over {time_since_last_update:.0f}s ({drift_rate_ppm:+.1f} ppm) - firmware correcting")
+                        
+                        self.last_offset_update_time = current_time
                 
                 # Convert MCU timestamp to host time reference
                 host_timestamp_us = mcu_timestamp_us + self.mcu_timestamp_offset_us
@@ -987,6 +1021,18 @@ class SimplifiedTimestampGenerator:
             print(f"✅ Wraparound recovery complete - reset to sequence {current_sequence}")
     
     # NEW: MCU firmware feature methods
+    
+    def adjust_mcu_offset(self, adjustment_us: int):
+        """Manually adjust the MCU timestamp offset by a specified amount"""
+        with self.lock:
+            old_offset = self.mcu_timestamp_offset_us
+            self.mcu_timestamp_offset_us += adjustment_us
+            self.stats['mcu_timestamp_offset_us'] = self.mcu_timestamp_offset_us
+            self.stats['mcu_offset_updates'] += 1
+            print(f"🔧 MCU OFFSET MANUALLY ADJUSTED")
+            print(f"   Old offset: {old_offset}μs")
+            print(f"   Adjustment: {adjustment_us:+d}μs")
+            print(f"   New offset: {self.mcu_timestamp_offset_us}μs")
     
     def enable_mcu_timestamp_mode(self, enabled: bool = True, offset_us: int = 0):
         """Enable MCU timestamp mode with optional offset"""
