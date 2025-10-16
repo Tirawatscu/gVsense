@@ -791,11 +791,18 @@ class SimplifiedTimestampGenerator:
                     print(f"🚨 PROACTIVE WRAPAROUND DETECTION IN GENERATOR: {self.last_sequence} -> {sequence_number}")
                     print(f"   Forcing wraparound recovery to prevent data loss")
                     
-                    # Force wraparound recovery
+                    # Force wraparound recovery (uses last_timestamp for continuity)
                     self.force_wraparound_recovery(sequence_number)
                     
-                    # Generate timestamp using current time
-                    timestamp_ms = int(timestamp_s * 1000)
+                    # CRITICAL FIX: Calculate expected timestamp, don't use current_time
+                    # Continue from last timestamp + one interval
+                    if self.stats.get('last_timestamp') is not None:
+                        expected_timestamp_s = self.stats['last_timestamp'] + self.expected_interval_s
+                        timestamp_ms = int(expected_timestamp_s * 1000)
+                    else:
+                        # Fallback if no last timestamp
+                        timestamp_ms = int(timestamp_s * 1000)
+                    
                     quantized_timestamp_ms = round(timestamp_ms / self.quantization_ms) * self.quantization_ms
                     self.stats['last_timestamp'] = quantized_timestamp_ms / 1000.0
                     return quantized_timestamp_ms
@@ -806,11 +813,18 @@ class SimplifiedTimestampGenerator:
                     print(f"🚨 DIRECT WRAPAROUND DETECTION: {self.last_sequence} -> {sequence_number}")
                     print(f"   Detected exact 65535 -> 0 transition")
                     
-                    # Force wraparound recovery
+                    # Force wraparound recovery (uses last_timestamp for continuity)
                     self.force_wraparound_recovery(sequence_number)
                     
-                    # Generate timestamp using current time
-                    timestamp_ms = int(timestamp_s * 1000)
+                    # CRITICAL FIX: Calculate expected timestamp, don't use current_time
+                    # Continue from last timestamp + one interval
+                    if self.stats.get('last_timestamp') is not None:
+                        expected_timestamp_s = self.stats['last_timestamp'] + self.expected_interval_s
+                        timestamp_ms = int(expected_timestamp_s * 1000)
+                    else:
+                        # Fallback if no last timestamp
+                        timestamp_ms = int(timestamp_s * 1000)
+                    
                     quantized_timestamp_ms = round(timestamp_ms / self.quantization_ms) * self.quantization_ms
                     self.stats['last_timestamp'] = quantized_timestamp_ms / 1000.0
                     return quantized_timestamp_ms
@@ -1007,9 +1021,21 @@ class SimplifiedTimestampGenerator:
             print(f"   Last sequence: {self.last_sequence}")
             print(f"   Reference sequence: {self.reference_sequence}")
             
-            # Reset to current sequence and reinitialize with 64-bit timestamp
+            # CRITICAL FIX: Calculate expected next timestamp, don't jump to current time
+            # Continue from the last timestamp + one interval
+            if self.stats.get('last_timestamp') is not None:
+                # Use last timestamp and add one interval for continuity
+                expected_next_time_s = self.stats['last_timestamp'] + self.expected_interval_s
+                self.reference_time_64 = int(expected_next_time_s * 1000000)
+                print(f"   Continuing from last_timestamp: {self.stats['last_timestamp']:.6f}s")
+                print(f"   Expected next time: {expected_next_time_s:.6f}s")
+            else:
+                # Fallback: use current time if no last timestamp
+                self.reference_time_64 = int(time.time() * 1000000)
+                print(f"   No last_timestamp, using current time")
+            
+            # Reset to current sequence
             self.reference_sequence = current_sequence
-            self.reference_time_64 = int(time.time() * 1000000)  # 64-bit microseconds
             self.last_sequence = current_sequence
             self.is_initialized = True
             
