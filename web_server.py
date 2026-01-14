@@ -787,6 +787,34 @@ def get_status():
         'pps_lock_status': pps_lock_status
     }
     
+    # NEW: Add GPS location status
+    gps_location_status = {
+        'enabled': gps_config.get('enabled', False),
+        'running': False,
+        'update_count': 0,
+        'error_count': 0,
+        'last_update': None,
+        'last_location': None
+    }
+    if gps_updater:
+        try:
+            gps_stats = gps_updater.get_stats()
+            gps_location_status.update({
+                'running': gps_stats.get('running', False),
+                'update_count': gps_stats.get('update_count', 0),
+                'error_count': gps_stats.get('error_count', 0),
+                'last_update': gps_stats.get('last_update'),
+                'interval_seconds': gps_stats.get('interval_seconds', 60)
+            })
+            
+            # Try to get the last GPS location from the GPS reader
+            if hasattr(gps_updater, 'gps_reader') and hasattr(gps_updater.gps_reader, '_last_valid_location'):
+                last_loc = gps_updater.gps_reader._last_valid_location
+                if last_loc:
+                    gps_location_status['last_location'] = last_loc
+        except Exception as e:
+            print(f"Error getting GPS location status: {e}")
+    
     return jsonify({
         'device': device_status,
         'time_source': time_source_status,
@@ -811,6 +839,7 @@ def get_status():
         'adaptive_timing': adaptive_status,  # NEW: Adaptive timing controller status
         'mcu_calibration': mcu_calibration_status,  # NEW: MCU calibration status
         'auto_start': auto_start_status,  # NEW: Auto-start trigger status
+        'gps_location': gps_location_status,  # NEW: GPS location tracking status
         'thingsboard': {
             'enabled': tb_config.get('enabled', False),
             'config': tb_config,

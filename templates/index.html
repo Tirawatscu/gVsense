@@ -741,6 +741,49 @@
                     </div>
                 </div>
                 
+                <!-- GPS Location Panel -->
+                <div class="panel" id="gps-panel" style="display: none;">
+                    <h2>🌍 GPS Location</h2>
+                    <div class="status-grid">
+                    <div class="status-item">
+                            <span class="status-label">Status</span>
+                        <span class="status-value">
+                                <span id="gps-status">Unknown</span>
+                                <span id="gps-indicator" class="status-indicator status-warning"></span>
+                        </span>
+                    </div>
+                    <div class="status-item">
+                            <span class="status-label">Latitude</span>
+                            <span class="status-value" id="gps-latitude">--</span>
+                    </div>
+                    <div class="status-item">
+                            <span class="status-label">Longitude</span>
+                            <span class="status-value" id="gps-longitude">--</span>
+                    </div>
+                    <div class="status-item">
+                            <span class="status-label">Altitude</span>
+                            <span class="status-value" id="gps-altitude">-- m</span>
+                    </div>
+                    <div class="status-item">
+                            <span class="status-label">Satellites</span>
+                            <span class="status-value" id="gps-satellites">--</span>
+                    </div>
+                    <div class="status-item">
+                            <span class="status-label">Accuracy</span>
+                            <span class="status-value" id="gps-accuracy">-- m</span>
+                    </div>
+                    <div class="status-item">
+                            <span class="status-label">Last Update</span>
+                            <span class="status-value" id="gps-last-update">--</span>
+                    </div>
+                    <div class="status-item">
+                            <span class="status-label">Updates</span>
+                            <span class="status-value" id="gps-update-count">0</span>
+                    </div>
+                    </div>
+                    <button class="btn btn-small" onclick="openGoogleMaps()">📍 View on Map</button>
+                </div>
+                
                 <!-- Data Quality Panel -->
                 <div class="panel">
                     <h2>📊 Data Quality</h2>
@@ -1064,6 +1107,9 @@
             // Update storage status
             updateStorageStatus(status);
             
+            // Update GPS location status
+            updateGPSStatus(status);
+            
             // Update statistics
             updateStatistics(status);
             
@@ -1268,6 +1314,93 @@
             const tbToggleBtn = document.getElementById('tb-toggle-btn');
             if (tbToggleBtn) {
                 tbToggleBtn.textContent = tbEnabled ? 'Disable ThingsBoard' : 'Enable ThingsBoard';
+            }
+        }
+        
+        function updateGPSStatus(status) {
+            const gpsData = status.gps_location;
+            const gpsPanel = document.getElementById('gps-panel');
+            
+            // Show/hide GPS panel based on whether GPS is enabled
+            if (gpsData && gpsData.enabled) {
+                gpsPanel.style.display = 'block';
+                
+                const running = gpsData.running || false;
+                const lastUpdate = gpsData.last_update;
+                const updateCount = gpsData.update_count || 0;
+                const errorCount = gpsData.error_count || 0;
+                
+                // Update GPS status
+                if (running && updateCount > 0) {
+                    document.getElementById('gps-status').textContent = 'Active';
+                    document.getElementById('gps-indicator').className = 'status-indicator status-good';
+                } else if (running) {
+                    document.getElementById('gps-status').textContent = 'Waiting for fix...';
+                    document.getElementById('gps-indicator').className = 'status-indicator status-warning';
+                } else {
+                    document.getElementById('gps-status').textContent = 'Disabled';
+                    document.getElementById('gps-indicator').className = 'status-indicator status-error';
+                }
+                
+                // Update GPS coordinates if available
+                if (gpsData.last_location) {
+                    const loc = gpsData.last_location;
+                    document.getElementById('gps-latitude').textContent = 
+                        loc.latitude ? loc.latitude.toFixed(6) + '°' : '--';
+                    document.getElementById('gps-longitude').textContent = 
+                        loc.longitude ? loc.longitude.toFixed(6) + '°' : '--';
+                    document.getElementById('gps-altitude').textContent = 
+                        loc.altitude ? loc.altitude.toFixed(1) + ' m' : '-- m';
+                    document.getElementById('gps-satellites').textContent = 
+                        loc.satellites || '--';
+                    document.getElementById('gps-accuracy').textContent = 
+                        loc.accuracy ? loc.accuracy.toFixed(1) + ' m' : '-- m';
+                    
+                    // Store coordinates for map function
+                    window.gpsCoordinates = {
+                        lat: loc.latitude,
+                        lon: loc.longitude
+                    };
+                } else {
+                    document.getElementById('gps-latitude').textContent = '--';
+                    document.getElementById('gps-longitude').textContent = '--';
+                    document.getElementById('gps-altitude').textContent = '-- m';
+                    document.getElementById('gps-satellites').textContent = '--';
+                    document.getElementById('gps-accuracy').textContent = '-- m';
+                }
+                
+                // Update last update time
+                if (lastUpdate) {
+                    const now = Date.now() / 1000;
+                    const elapsed = now - lastUpdate;
+                    if (elapsed < 60) {
+                        document.getElementById('gps-last-update').textContent = 
+                            `${Math.floor(elapsed)}s ago`;
+                    } else if (elapsed < 3600) {
+                        document.getElementById('gps-last-update').textContent = 
+                            `${Math.floor(elapsed / 60)}m ago`;
+                    } else {
+                        document.getElementById('gps-last-update').textContent = 
+                            `${Math.floor(elapsed / 3600)}h ago`;
+                    }
+                } else {
+                    document.getElementById('gps-last-update').textContent = '--';
+                }
+                
+                // Update counts
+                document.getElementById('gps-update-count').textContent = updateCount;
+            } else {
+                // Hide GPS panel if not enabled
+                gpsPanel.style.display = 'none';
+            }
+        }
+        
+        function openGoogleMaps() {
+            if (window.gpsCoordinates && window.gpsCoordinates.lat && window.gpsCoordinates.lon) {
+                const url = `https://www.google.com/maps?q=${window.gpsCoordinates.lat},${window.gpsCoordinates.lon}`;
+                window.open(url, '_blank');
+            } else {
+                alert('GPS coordinates not available yet');
             }
         }
         
