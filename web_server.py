@@ -1539,7 +1539,13 @@ def handle_config():
         
         if 'stream_rate' in new_config:
             if 1 <= new_config['stream_rate'] <= 1000:
+                old_rate = config.get('stream_rate', 100.0)
                 config['stream_rate'] = new_config['stream_rate']
+                
+                # Update adaptive controller target rate if it exists
+                if adaptive_controller:
+                    adaptive_controller.update_target_rate(new_config['stream_rate'])
+                    print(f"Updated adaptive controller rate: {old_rate} Hz → {new_config['stream_rate']} Hz")
         
         if 'send_g_units' in new_config:
             config['send_g_units'] = bool(new_config['send_g_units'])
@@ -1656,7 +1662,7 @@ def start_stream():
             if not adaptive_controller:
                 from adaptive_timing_controller import CompatibilityAdaptiveTimingController
                 adaptive_controller = CompatibilityAdaptiveTimingController(
-                    seismic, seismic.timing_manager
+                    seismic, seismic.timing_manager, target_rate=config.get('stream_rate', 100.0)
                 )
             
             # ADAPTIVE CONTROL STRATEGY:
@@ -1868,7 +1874,7 @@ def check_auto_start_trigger():
                                 if not adaptive_controller:
                                     from adaptive_timing_controller import CompatibilityAdaptiveTimingController
                                     adaptive_controller = CompatibilityAdaptiveTimingController(
-                                        seismic, seismic.timing_manager
+                                        seismic, seismic.timing_manager, target_rate=config.get('stream_rate', 100.0)
                                     )
                                 
                                 # CRITICAL WORK MODE: Disable timing control for zero data loss
@@ -2348,7 +2354,7 @@ def enable_adaptive_control():
     try:
         if enable:
             if not adaptive_controller:
-                adaptive_controller = AdaptiveTimingController(seismic, seismic.timing_manager)
+                adaptive_controller = AdaptiveTimingController(seismic, seismic.timing_manager, target_rate=config.get('stream_rate', 100.0))
             
             # ENSURE CORRECTIONS ARE ENABLED
             adaptive_controller.set_corrections_enabled(True)

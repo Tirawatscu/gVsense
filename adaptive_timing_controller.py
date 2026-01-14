@@ -13,7 +13,7 @@ class CompatibilityAdaptiveTimingController:
     Delegates actual control to UnifiedTimingController
     """
     
-    def __init__(self, seismic_acquisition, timing_manager):
+    def __init__(self, seismic_acquisition, timing_manager, target_rate=None):
         # Store references for compatibility
         self.seismic = seismic_acquisition
         self.timing_manager = timing_manager
@@ -25,12 +25,21 @@ class CompatibilityAdaptiveTimingController:
             print("Warning: Seismic device missing unified timing adapter")
             self.unified_controller = None
         
+        # Auto-detect target rate from seismic device if not provided
+        if target_rate is None:
+            target_rate = self._detect_sampling_rate()
+        
+        # Validate and set target rate
+        if target_rate < 1 or target_rate > 1000:
+            print(f"Warning: Invalid sampling rate {target_rate} Hz, defaulting to 100 Hz")
+            target_rate = 100.0
+        
         # Compatibility properties
         self.running = False
         self.enable_corrections = True
-        self.target_rate = 100.0
-        self.target_interval_us = 10000
-        self.current_interval_us = 10000.0
+        self.target_rate = float(target_rate)
+        self.target_interval_us = int(1e6 / target_rate)
+        self.current_interval_us = float(self.target_interval_us)
         
         # Timing parameters for compatibility
         self.measurement_interval = 10.0
@@ -38,13 +47,40 @@ class CompatibilityAdaptiveTimingController:
         self.kp = 1.0
         self.ki = 0.3
         self.kd = 0.2
+        
+        print(f"📊 Adaptive controller initialized: {self.target_rate:.2f} Hz ({self.target_interval_us} µs)")
+    
+    def _detect_sampling_rate(self):
+        """Auto-detect sampling rate from seismic device"""
+        # Try multiple sources in order of preference
+        
+        # 1. Check sample_tracking which is set during streaming
+        if hasattr(self.seismic, 'sample_tracking'):
+            rate = self.seismic.sample_tracking.get('expected_rate', None)
+            if rate and 1 <= rate <= 1000:
+                print(f"   Detected rate from sample_tracking: {rate} Hz")
+                return rate
+        
+        # 2. Check timestamp_generator rate
+        if hasattr(self.seismic, 'timestamp_generator'):
+            if hasattr(self.seismic.timestamp_generator, 'expected_rate'):
+                rate = self.seismic.timestamp_generator.expected_rate
+                if rate and 1 <= rate <= 1000:
+                    print(f"   Detected rate from timestamp_generator: {rate} Hz")
+                    return rate
+        
+        # 3. Default fallback
+        print("   No rate detected, using default: 100 Hz")
+        return 100.0
     
     def start_controller(self):
         """Start the controller (delegates to unified system)"""
         if self.unified_controller:
+            # Configure adaptive control with current target rate
+            self.unified_controller.set_adaptive_control(True, self.target_rate)
             self.unified_controller.start_controller()
             self.running = True
-            print("Adaptive timing controller started (unified mode)")
+            print(f"Adaptive timing controller started (unified mode, target: {self.target_rate:.2f} Hz)")
         else:
             print("Warning: Unified controller not available")
     
@@ -73,7 +109,7 @@ class CompatibilityAdaptiveTimingController:
                 
                 if result and result[0]:
                     self.current_interval_us = float(self.target_interval_us)
-                    print(f"Reset to baseline: {self.target_interval_us}µs (100.00Hz)")
+                    print(f"Reset to baseline: {self.target_interval_us}µs ({self.target_rate:.2f}Hz)")
                     return True
                 else:
                     print(f"Reset failed: {result}")
@@ -95,6 +131,47 @@ class CompatibilityAdaptiveTimingController:
             print("Controller state reset (unified mode)")
             return True
         return False
+    
+    def update_target_rate(self, new_rate):
+        """Update the target sampling rate dynamically
+        
+        Args:
+            new_rate: New sampling rate in Hz (1-1000)
+            
+        Returns:
+            bool: True if update successful, False otherwise
+        """
+        try:
+            # Validate rate
+            if new_rate < 1 or new_rate > 1000:
+                print(f"Error: Invalid sampling rate {new_rate} Hz (must be 1-1000 Hz)")
+                return False
+            
+            old_rate = self.target_rate
+            old_interval = self.target_interval_us
+            
+            # Update rate and interval
+            self.target_rate = float(new_rate)
+            self.target_interval_us = int(1e6 / new_rate)
+            self.current_interval_us = float(self.target_interval_us)
+            
+            # Notify unified controller if available
+            if self.unified_controller:
+                self.unified_controller.set_adaptive_control(True, new_rate)
+            
+            print(f"📊 Sampling rate updated: {old_rate:.2f} Hz → {new_rate:.2f} Hz")
+            print(f"   Interval: {old_interval} µs → {self.target_interval_us} µs")
+            
+            # If controller is running, reset to new baseline
+            if self.running:
+                print("   Applying new rate to MCU...")
+                return self.reset_to_baseline()
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error updating target rate: {e}")
+            return False
     
     def get_stats(self):
         """Get statistics (compatible with existing interface)"""
