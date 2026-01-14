@@ -87,5 +87,12 @@
         "pps_signal_count_threshold": 5,
         "check_interval_seconds": 5,
         "description": "Automatically start streaming when GPS+PPS lock is achieved"
+    },
+    "gps_location": {
+        "enabled": true,
+        "update_interval_seconds": 60,
+        "method": "gpsd",
+        "mock_coordinates": null,
+        "description": "GPS location tracking - stores sensor coordinates in InfluxDB"
     }
 }

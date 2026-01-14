@@ -21,6 +21,8 @@ import numpy as np
 from host_timing_acquisition import HostTimingSeismicAcquisition
 from data_saver import DataSaver
 from adaptive_timing_controller import AdaptiveTimingController
+from gps_updater import GPSUpdater
+from gps_reader import create_gps_reader
 
 def make_json_safe(obj):
     """Convert non-JSON-serializable objects to JSON-safe format"""
@@ -244,6 +246,8 @@ baseline_tracker = {
 
 # Data saving configuration
 data_saver = None
+gps_updater = None  # GPS location updater
+gps_config = app_config.get('gps_location', {}) if app_config else {}
 saving_config = {
     'csv_enabled': app_config['data_saving']['csv']['enabled'] if app_config else False,
     'csv_directory': app_config['data_saving']['csv']['directory'] if app_config else 'data',
@@ -371,11 +375,16 @@ def create_new_csv_file():
 
 def create_data_saver():
     """Create a new DataSaver instance with current configuration"""
-    global data_saver, saving_config, tb_config
+    global data_saver, saving_config, tb_config, gps_updater, gps_config
     
     # Close existing data saver
     if data_saver:
         data_saver.close()
+    
+    # Stop existing GPS updater
+    if gps_updater:
+        gps_updater.stop()
+        gps_updater = None
     
     # Prepare CSV configuration
     csv_filename = None
@@ -402,6 +411,34 @@ def create_data_saver():
         )
         tb_status = "ThingsBoard enabled" if tb_config.get('enabled') and data_saver and data_saver.is_thingsboard_connected() else "ThingsBoard disabled or not connected"
         print(f"Created DataSaver - CSV: {csv_filename is not None}, InfluxDB: {influx_config is not None}, {tb_status}")
+        
+        # Initialize GPS location tracking if enabled and InfluxDB is available
+        if gps_config.get('enabled', False) and data_saver and data_saver.influx_writer:
+            try:
+                # Create GPS reader
+                mock_coords = gps_config.get('mock_coordinates')
+                gps_reader = create_gps_reader(mock_coordinates=mock_coords)
+                
+                # Create GPS updater
+                update_interval = gps_config.get('update_interval_seconds', 60)
+                gps_updater = GPSUpdater(
+                    influx_writer=data_saver.influx_writer,
+                    gps_reader=gps_reader,
+                    interval_seconds=update_interval
+                )
+                
+                # Start GPS updates
+                gps_updater.start()
+                print(f"GPS location tracking enabled (update interval: {update_interval}s)")
+            except Exception as e:
+                print(f"Error initializing GPS location tracking: {e}")
+                gps_updater = None
+        else:
+            if not gps_config.get('enabled', False):
+                print("GPS location tracking disabled in config")
+            elif not data_saver or not data_saver.influx_writer:
+                print("GPS location tracking requires InfluxDB to be enabled")
+                
     except Exception as e:
         print(f"Error creating DataSaver: {e}")
         data_saver = None
@@ -1379,10 +1416,14 @@ def handle_disconnect():
 
 def cleanup_resources():
     """Cleanup resources on shutdown"""
-    global data_saver
+    global data_saver, gps_updater
     
     if csv_logging['file_handle']:
         csv_logging['file_handle'].close()
+    
+    if gps_updater:
+        print("Stopping GPS updater...")
+        gps_updater.stop()
     
     if data_saver:
         data_saver.close()
