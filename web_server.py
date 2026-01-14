@@ -225,7 +225,7 @@ if 'timestamp_quantization_ms' not in config:
 # Voltage per count: 2.5V / 8,388,608 = 2.98e-7 V/count
 # Sensitivity: 2g / 3.6V = 0.556 g/V
 # Combined: 2.98e-7 V/count × 0.556 g/V = 1.656e-7 g/count
-ADC_BITS = 32
+'''ADC_BITS = 32
 ADC_HALF_RANGE = 2**(ADC_BITS-1)  # 8,388,608
 ADC_VOLTAGE_RANGE = 2.5  # ±2.5V
 SENSOR_G_RANGE = 2.0  # ±2g
@@ -234,7 +234,30 @@ SENSOR_VOLTAGE_RANGE = 3.6  # ±3.6V
 # Calculate conversion factor: counts to g
 COUNTS_TO_VOLTS = ADC_VOLTAGE_RANGE / ADC_HALF_RANGE  # V/count
 VOLTS_TO_G = SENSOR_G_RANGE / SENSOR_VOLTAGE_RANGE   # g/V
-COUNTS_TO_G = COUNTS_TO_VOLTS * VOLTS_TO_G           # g/count
+COUNTS_TO_G = COUNTS_TO_VOLTS * VOLTS_TO_G           # g/count'''
+
+ADC_EFFECTIVE_BITS = 32
+ADC_HALF_RANGE = 2**(ADC_EFFECTIVE_BITS - 1)  # for signed bipolar: ±(2^(N-1)-1)
+
+ADC_VOLTAGE_RANGE = 2.5  # ±2.5 V full-scale at ADC input
+
+# Voltage per count (LSB)
+COUNTS_TO_VOLTS = ADC_VOLTAGE_RANGE / ADC_HALF_RANGE  # V/count
+
+# ===== Geophone sensitivity =====
+# Given formula: 0.032*sqrt(Rc) V/(in/s), Rc = 3800 ohm
+Rc = 3800.0
+SENS_V_PER_IN_PER_S = 0.032 * np.sqrt(Rc)          # V/(in/s)
+SENS_V_PER_M_PER_S  = SENS_V_PER_IN_PER_S / 0.0254   # V/(m/s) because 1 in/s = 0.0254 m/s
+
+# Convert volts -> velocity (m/s)
+VOLTS_TO_M_PER_S = 1.0 / SENS_V_PER_M_PER_S          # (m/s)/V
+
+# Direct conversion: counts -> velocity (m/s)
+COUNTS_TO_M_PER_S = COUNTS_TO_VOLTS * VOLTS_TO_M_PER_S
+
+# Convenience: counts -> mm/s
+COUNTS_TO_G = COUNTS_TO_M_PER_S * 1000.0
 
 # Baseline tracking for mean removal
 baseline_tracker = {
