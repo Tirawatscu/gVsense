@@ -257,7 +257,7 @@ VOLTS_TO_M_PER_S = 1.0 / SENS_V_PER_M_PER_S          # (m/s)/V
 COUNTS_TO_M_PER_S = COUNTS_TO_VOLTS * VOLTS_TO_M_PER_S
 
 # Convenience: counts -> mm/s
-COUNTS_TO_G = COUNTS_TO_M_PER_S * 1000.0
+COUNTS_TO_G = COUNTS_TO_M_PER_S
 
 # Baseline tracking for mean removal
 baseline_tracker = {
