@@ -182,6 +182,67 @@ class InfluxWriter:
             self._do_write_sample(timestamp, fields, tags)
         return True
 
+    def write_gps_location(self, timestamp, latitude, longitude, altitude=None, accuracy=None, satellites=None, tags=None):
+        """
+        Write GPS location update to separate measurement
+        Call this periodically (e.g., every minute) or when location changes
+        
+        Args:
+            timestamp: Unix timestamp in milliseconds
+            latitude: GPS latitude (float)
+            longitude: GPS longitude (float)
+            altitude: GPS altitude in meters (optional)
+            accuracy: GPS accuracy in meters (optional)
+            satellites: Number of satellites (optional, for monitoring)
+            tags: Additional tags (e.g., location_name)
+        """
+        if not self.connected:
+            return False
+        
+        try:
+            # Convert timestamp to nanoseconds
+            if isinstance(timestamp, str) and '.' in timestamp:
+                timestamp_ms = int(float(timestamp))
+            else:
+                timestamp_ms = int(timestamp)
+            ts_ns = timestamp_ms * 1_000_000
+            
+            # Prepare GPS fields
+            gps_fields = {
+                'latitude': float(latitude),
+                'longitude': float(longitude)
+            }
+            
+            if altitude is not None:
+                gps_fields['altitude'] = float(altitude)
+            
+            if accuracy is not None:
+                gps_fields['accuracy'] = float(accuracy)
+                
+            if satellites is not None:
+                gps_fields['satellites'] = int(satellites)
+            
+            # Optional: Add geohash for spatial queries
+            try:
+                import pygeohash as pgh
+                gps_fields['geohash'] = pgh.encode(latitude, longitude, precision=7)
+            except ImportError:
+                pass  # geohash is optional
+            
+            # Use buffer if enabled, otherwise write directly
+            if self.buffer_on_error:
+                # Create a special tuple to indicate GPS measurement
+                self.q.put((ts_ns, gps_fields, tags, "sensor_location"))
+                self.stats['buffer_size'] = self.q.qsize()
+            else:
+                self._do_write_gps(ts_ns, gps_fields, tags)
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error preparing GPS location: {e}")
+            return False
+
     def _do_write_sample(self, timestamp, fields, tags=None):
         """Internal method to write sample to InfluxDB"""
         try:
@@ -240,6 +301,30 @@ class InfluxWriter:
             self.logger.error(f"InfluxDB write failed: {e}")
             self.stats['write_errors'] += 1
 
+    def _do_write_gps(self, timestamp, fields, tags=None):
+        """Internal method to write GPS data to InfluxDB"""
+        try:
+            point = Point("sensor_location").time(timestamp)
+            
+            # Add fields
+            for k, v in fields.items():
+                point.field(k, v)
+            
+            # Add tags
+            all_tags = dict(self.common_tags)
+            if tags:
+                all_tags.update(tags)
+            for k, v in all_tags.items():
+                point.tag(k, str(v))
+            
+            # Write to InfluxDB
+            self.write_api.write(bucket=self.bucket, org=self.org, record=point)
+            self.logger.info(f"GPS location written: lat={fields.get('latitude')}, lon={fields.get('longitude')}")
+            
+        except Exception as e:
+            self.logger.error(f"InfluxDB GPS write failed: {e}")
+            self.stats['write_errors'] += 1
+
     def _worker_loop(self):
         """Background worker thread for buffered writing"""
         self.logger.info("InfluxDB worker thread started")
@@ -248,10 +333,16 @@ class InfluxWriter:
             try:
                 # Get item from queue with timeout
                 item = self.q.get(timeout=0.5)
-                timestamp, fields, tags = item
                 
-                # Write the sample
-                self._do_write_sample(timestamp, fields, tags)
+                # Check if it's GPS data (4 elements) or seismic data (3 elements)
+                if len(item) == 4:
+                    timestamp, fields, tags, measurement_type = item
+                    if measurement_type == "sensor_location":
+                        self._do_write_gps(timestamp, fields, tags)
+                else:
+                    timestamp, fields, tags = item
+                    self._do_write_sample(timestamp, fields, tags)
+                
                 self.q.task_done()
                 
                 # Update buffer size stat

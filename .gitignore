@@ -48,3 +48,6 @@ Thumbs.db
 # Ignore device-specific configs
 config.conf
 *.conf
+.cursor/worktrees.json
+.gitignore
+GPS_INTEGRATION.md
